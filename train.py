@@ -22,6 +22,13 @@ from diffusers import (
     FluxTransformer2DModel,
 )
 from peft import LoraConfig, set_peft_model_state_dict
+from utils import PairedImageDataset, collate_fn, encode_prompt
+from diffusers.training_utils import (
+    cast_training_params,
+    free_memory,
+)
+from diffusers.utils.torch_utils import is_compiled_module
+
 
 if is_wandb_available():
     import wandb
@@ -340,6 +347,58 @@ def main(args):
             use_bias_correction=args.prodigy_use_bias_correction,
             safeguard_warmup=args.prodigy_safeguard_warmup,
         )
+
+    # Dataset and PairedImageDataset creation:
+    train_dataset = PairedImageDataset(
+        args=args,
+        split="train",
+    )
+    val_dataset = PairedImageDataset(
+        args=args,
+        split="test",
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,          # no lambda, no extra arg
+        num_workers=1,
+    )
+    validation_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn, 
+        num_workers=1,
+    )
+
+    if freeze_text_encoder:
+        tokenizers = [tokenizer_one, tokenizer_two]
+        text_encoders = [text_encoder_one, text_encoder_two]
+
+        def compute_text_embeddings(prompt, text_encoders, tokenizers):
+            with torch.no_grad():
+                prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
+                    text_encoders, tokenizers, prompt, args.max_sequence_length
+                )
+                prompt_embeds = prompt_embeds.to(accelerator.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
+                text_ids = text_ids.to(accelerator.device)
+            return prompt_embeds, pooled_prompt_embeds, text_ids
+
+
+    # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
+    # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
+    # the redundant encoding.
+    single_prompt = (not train_dataset.use_caption) and (args.instance_prompt is not None)
+    if freeze_text_encoder and single_prompt:
+        instance_prompt_hidden_states, instance_pooled_prompt_embeds, instance_text_ids = compute_text_embeddings(
+            args.instance_prompt, text_encoders, tokenizers
+        )
+        del tokenizers, text_encoders, text_encoder_one, text_encoder_two
+        free_memory()
+
 
 if __name__ == "__main__":
     args = parse_args()

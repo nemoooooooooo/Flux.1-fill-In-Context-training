@@ -148,6 +148,130 @@ def parse_args(input_args=None):
         default=128,
         help=("The dimension of the LoRA update matrices."),
     )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        required=True,
+        help=(
+            "The name of the Dataset (from the HuggingFace hub) containing the training data of instance images (could be your own, possibly private,"
+            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
+            " or to a folder containing files that 🤗 Datasets can understand."
+        ),
+    )
+    parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="The config of the Dataset, leave as None if there's only one config.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="The directory where the downloaded models and datasets will be stored.",
+    )
+    parser.add_argument(
+        "--source_image_column",
+        type=str,
+        default="source",
+        help="The column of the dataset containing the input image. By "
+        "default, the standard Image Dataset maps out 'file_name' "
+        "to 'image'.",
+    )
+    parser.add_argument(
+        "--target_image_column",
+        type=str,
+        default="target",
+        help="The column of the dataset containing the target image. By "
+        "default, the standard Image Dataset maps out 'file_name' "
+        "to 'image'.",
+    )
+    parser.add_argument(
+        "--mask_column",
+        type=str,
+        default=None,
+        help="The column of the dataset containing the mask image. By "
+        "default, the loader will create split masks.",
+    )
+    parser.add_argument(
+        "--caption_column",
+        type=str,
+        default="caption",
+        help="The column of the dataset containing the instance prompt for each image",
+    )
+    parser.add_argument(
+        "--instance_prompt",
+        type=str,
+        help="The prompt with identifier specifying the instance, e.g. 'photo of a TOK dog', 'in the style of TOK'",
+    )
+    parser.add_argument(
+        "--aspect_ratio_buckets",
+        type=str,
+        default="1184,880",
+        help="Comma-separated list of aspect ratios to use for image resizing. (str | None)  e.g. '(512,512),(768,512)'",
+    )
+    parser.add_argument(
+        "--random_flip",
+        action="store_true",
+        help="Whether to randomly flip the images during training."
+    )
+    parser.add_argument(
+        "--random_crop",
+        action="store_true",
+        help="Whether to randomly crop the images during training."
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help=(
+            "The number of times to repeat the dataset. This is useful when the dataset is small and you want to"
+            " increase the effective batch size."
+        )
+    )
+    parser.add_argument(
+        "--center_crop",
+        action="store_true",
+        help="Whether to center crop the images during training."
+    )
+    parser.add_argument(
+        "--color_jitter",
+        type=str,
+        default="0.2,0.2,0.2,0.05",            
+        help=(
+            "The amount of color jitter to apply to the images during training. This is a float value that will be"
+            " used to create a ColorJitter transform with the same value for brightness, contrast, saturation, and hue."
+        )
+    )
+    parser.add_argument(
+        "--random_grayscale",
+        type=float, 
+        default=0.7,
+        help="The probability of converting the image to grayscale during training."
+    )
+    parser.add_argument(
+        "--gaussian_blur",
+        type=float, 
+        default=0.8,    
+        help="max sigma (0 = off)"
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="Batch size (per device) for the training dataloader. This is the effective batch size, which is the product of the per-device batch size and the number of devices.",
+    )
+    parser.add_argument(
+        "--max_sequence_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length to use with with the T5 text encoder",
+    )
+    parser.add_argument(
+        "--panel_mode", 
+        choices=["paired", "single"], 
+        default="paired"
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
