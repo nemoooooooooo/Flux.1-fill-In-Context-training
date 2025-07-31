@@ -1,5 +1,6 @@
 from args_parser import parse_args
 import torch
+import shutil
 from pathlib import Path 
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from accelerate import Accelerator
@@ -22,13 +23,22 @@ from diffusers import (
     FluxTransformer2DModel,
 )
 from peft import LoraConfig, set_peft_model_state_dict
-from utils import PairedImageDataset, collate_fn, encode_prompt
+from utils import PairedImageDataset, collate_fn, encode_prompt, prepare_mask_latents
 from diffusers.training_utils import (
     cast_training_params,
+    compute_density_for_timestep_sampling,
+    compute_loss_weighting_for_sd3,
     free_memory,
 )
 from diffusers.utils.torch_utils import is_compiled_module
-
+from typing import List, Union
+import math
+from diffusers.optimization import get_scheduler
+from tqdm.auto import tqdm
+from peft.utils import get_peft_model_state_dict
+from contextlib import nullcontext
+from torchvision import transforms
+from huggingface_hub import create_repo, upload_folder
 
 if is_wandb_available():
     import wandb
@@ -37,6 +47,62 @@ if is_wandb_available():
 check_min_version("0.32.0.dev0")
 
 logger = get_logger(__name__)
+
+def log_validation(pipeline, args, accelerator, dataloader, tag="validation"):
+    logger.info(f"Running {tag}...")
+    pipeline = pipeline.to(accelerator.device)
+
+    if accelerator.mixed_precision == "bf16":
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+    elif accelerator.mixed_precision == "fp16":
+        autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+    else:
+        autocast_ctx = nullcontext()
+
+    gen = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
+    logged = []
+    with autocast_ctx:
+        for batch in dataloader:
+            prompt = batch["prompts"]
+            image  = batch["pixel_values"]            # source (inpaint) image if you need it
+            mask   = batch["mask_pixel_values"]       # mask tensor
+
+            # Convert mask/image tensors back to PIL for pipeline if needed
+            # (FluxFillPipeline usually takes PIL/np arrays)
+            pil_img  = [transforms.ToPILImage()(img.cpu()*0.5+0.5) for img in image]
+            pil_mask = [transforms.ToPILImage()(m.squeeze(0).cpu()) for m in mask]
+
+            out = pipeline(
+                prompt=prompt,
+                image=pil_img,
+                mask_image=pil_mask,
+                height=1024,
+                width=768,
+                num_inference_steps=28,
+                guidance_scale=30,
+                generator=gen,
+            ).images
+
+            logged.append((pil_img[0], pil_mask[0], out[0], prompt[0]))
+
+    for tracker in accelerator.trackers:
+        if tracker.name == "wandb":
+            wandb_imgs = []
+            for src, m, gen, pr in logged:
+                wandb_imgs.extend(
+                    [
+                        wandb.Image(src, caption="source"),
+                        wandb.Image(m,   caption="mask"),
+                        wandb.Image(gen, caption=pr),
+                    ]
+                )
+            tracker.log({tag: wandb_imgs})
+
+    # cleanup
+    del pipeline, logged
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -169,6 +235,14 @@ def main(args):
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
+    # -------------------------------------------------------------------
+    #  VAE constants that other helpers need
+    # -------------------------------------------------------------------
+    vae_shift   = vae.config.shift_factor
+    vae_scale   = vae.config.scaling_factor
+    vae_channels = vae.config.block_out_channels      # later for unpack/pack
+
+
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
@@ -202,6 +276,7 @@ def main(args):
     )
 
     transformer.add_adapter(transformer_lora_config)
+    transformer.to(accelerator.device, dtype=weight_dtype)   # move new adapters
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -355,7 +430,7 @@ def main(args):
     )
     val_dataset = PairedImageDataset(
         args=args,
-        split="test",
+        split=args.val_split,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -374,30 +449,422 @@ def main(args):
     )
 
     if freeze_text_encoder:
-        tokenizers = [tokenizer_one, tokenizer_two]
-        text_encoders = [text_encoder_one, text_encoder_two]
-
-        def compute_text_embeddings(prompt, text_encoders, tokenizers):
+        # --------------------------------------------------------------------------
+        # Prompt handling
+        #   • We never finetune a text-encoder, so embeddings can be cached
+        #     when every sample uses the same prompt.
+        #   • If the dataset provides per-image captions (`use_caption=True`)
+        #     we will recompute embeddings inside the training loop instead.
+        # --------------------------------------------------------------------------
+        def compute_prompt_embeddings(prompt: Union[str, List[str]]):
+            """
+            Wrapper around `encode_prompt` that
+            1. calls both encoders,
+            2. moves everything to the accelerator device, and
+            3. returns (prompt_embeds, pooled_embeds, text_ids)
+            """
             with torch.no_grad():
-                prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
-                    text_encoders, tokenizers, prompt, args.max_sequence_length
+                pe, pooled, tids = encode_prompt(
+                    text_encoders=[text_encoder_one, text_encoder_two],
+                    tokenizers=[tokenizer_one, tokenizer_two],
+                    prompt=prompt,
+                    max_sequence_length=args.max_sequence_length,
                 )
-                prompt_embeds = prompt_embeds.to(accelerator.device)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
-                text_ids = text_ids.to(accelerator.device)
-            return prompt_embeds, pooled_prompt_embeds, text_ids
+                return (
+                    pe.to(accelerator.device),
+                    pooled.to(accelerator.device),
+                    tids.to(accelerator.device),
+                )
+            
+        # --------------------------------------------------------------------------
+        # STATIC cache (single instance prompt, no captions)
+        # --------------------------------------------------------------------------
+        prompt_cache = None
+        if freeze_text_encoder and not train_dataset.use_caption:
+            inst_pe, inst_pool, inst_ids = compute_prompt_embeddings(args.instance_prompt)
+            prompt_cache = {"prompt": inst_pe, "pooled": inst_pool, "ids": inst_ids}
+
+            # free memory held by heavy encoders once we have the cache
+            del tokenizer_one, tokenizer_two, text_encoder_one, text_encoder_two
+            free_memory()
 
 
-    # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
-    # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
-    # the redundant encoding.
-    single_prompt = (not train_dataset.use_caption) and (args.instance_prompt is not None)
-    if freeze_text_encoder and single_prompt:
-        instance_prompt_hidden_states, instance_pooled_prompt_embeds, instance_text_ids = compute_text_embeddings(
-            args.instance_prompt, text_encoders, tokenizers
+        def get_batch_prompt_embeddings(batch_prompts, batch_size):
+            """
+            Returns embeddings for the current minibatch.
+            • When `prompt_cache` exists we just repeat the cached tensors.
+            • Otherwise we recompute on-the-fly (caption case).
+            """
+            if prompt_cache is not None:
+                # cache holds embeddings for **one** prompt; repeat to match batch
+                return (
+                    prompt_cache["prompt"].repeat(batch_size, 1, 1),
+                    prompt_cache["pooled"].repeat(batch_size, 1),
+                    prompt_cache["ids"].repeat(batch_size, 1, 1),
+                )
+            else:
+                return compute_prompt_embeddings(batch_prompts)
+
+
+
+    # -------------------------------------------------------------------
+    #  How many optimisation steps & LR schedule
+    # -------------------------------------------------------------------
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
+
+    overrode_max_train_steps = False
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler,                       # e.g. "constant_with_warmup"
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+    )
+
+    # -----------------------------------------------------------
+    # Send the objects to the Accelerator (only the pieces that are trainable / iterate in the loop)
+    # -----------------------------------------------------------
+    transformer, optimizer, train_dataloader, validation_dataloader, lr_scheduler = (
+        accelerator.prepare(
+            transformer,
+            optimizer,
+            train_dataloader,
+            validation_dataloader,   # ← include val loader so it’s on the right device/process group
+            lr_scheduler,
         )
-        del tokenizers, text_encoders, text_encoder_one, text_encoder_two
-        free_memory()
+    )
+
+    # -----------------------------------------------------------
+    # → recalc how many optimisation steps we really have
+    # -----------------------------------------------------------
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
+
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+
+    # Re-derive number of *whole* epochs we will actually run
+    args.num_train_epochs = math.ceil(
+        args.max_train_steps / num_update_steps_per_epoch
+    )
+
+    # -----------------------------------------------------------
+    # initialise experiment trackers
+    # -----------------------------------------------------------
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="lora-only-flux",
+            config=vars(args),        # logs full CLI config
+        )
+
+    # ------------------------------------------------------------------
+    # Training bookkeeping & (optional) checkpoint resume 
+    # ------------------------------------------------------------------
+    total_batch_size = (
+        args.batch_size                     # per-device batch
+        * accelerator.num_processes         # world size
+        * args.gradient_accumulation_steps
+    )
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
+    global_step  = 0
+    first_epoch  = 0
+    initial_global_step = 0
+
+    # ---------------------------------------------------------------
+    #  Resume from checkpoint (optional)
+    # ---------------------------------------------------------------
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            ckpt_dir = os.path.basename(args.resume_from_checkpoint)
+        else:
+            all_ckpts = sorted(
+                (d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")),
+                key=lambda x: int(x.split("-")[1]),
+            )
+            ckpt_dir = all_ckpts[-1] if all_ckpts else None
+
+        if ckpt_dir is None:
+            logger.info(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist – starting fresh."
+            )
+            args.resume_from_checkpoint = None
+        else:
+            logger.info(f"Resuming from checkpoint {ckpt_dir}")
+            accelerator.load_state(os.path.join(args.output_dir, ckpt_dir))
+            global_step  = int(ckpt_dir.split("-")[1])
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
+
+    # ---------------------------------------------------------------
+    #  Progress bar
+    # ---------------------------------------------------------------
+    progress_bar = tqdm(
+        range(initial_global_step, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        disable=not accelerator.is_local_main_process,
+    )
+
+    # ---------------------------------------------------------------
+    #  Helper to fetch σₜ values for the custom scheduler
+    # ---------------------------------------------------------------
+    def get_sigmas(timesteps, n_dim: int = 4, dtype: torch.dtype = torch.float32):
+        """
+        Map a batch of 'flow-matching' timesteps (0-1000) to their σ
+        as done in the original script.
+        """
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_ts = noise_scheduler_copy.timesteps.to(accelerator.device)
+        timesteps   = timesteps.to(accelerator.device)
+
+        idx = [(schedule_ts == t).nonzero().item() for t in timesteps]
+        sigma = sigmas[idx].flatten()
+        while sigma.ndim < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    # -----------------------------------------------
+    # inside the main training loop
+    # -----------------------------------------------
+    for epoch in range(first_epoch, args.num_train_epochs):
+        transformer.train()                       # LoRA layers are the only trainables
+
+        for step, batch in enumerate(train_dataloader):
+
+            with accelerator.accumulate(transformer):
+                # ──────────────────────────────
+                # 1. prompts  → embeddings
+                # ──────────────────────────────
+                prompts       = batch["prompts"]              # list[str]  len = current mini-batch
+                bsz           = len(prompts)
+                prompt_embeds, pooled_embeds, text_ids = get_batch_prompt_embeddings(
+                    prompts, batch_size=bsz
+                )                                             # (B,S,*) / (B,*) / (B,S,3)
+                # ──────────────────────────────
+                # 2. pixels   → latent z₀
+                # ──────────────────────────────
+                pixel_values = batch["pixel_values"].to(         
+                    dtype = vae.dtype,
+                    device = accelerator.device,
+                )
+
+
+                model_input = vae.encode(pixel_values).latent_dist.sample()
+                model_input = (model_input - vae_shift) * vae_scale
+                model_input = model_input.to(dtype = weight_dtype)
+
+                # ──────────────────────────────
+                # 3. mask   → mask latents
+                # ──────────────────────────────
+                mask         = batch["mask_pixel_values"].to(
+                    accelerator.device, dtype=vae.dtype
+                )                                                         # 1×H×W
+                masked_image = pixel_values * (1.0 - mask)
+
+                mask_lat, masked_img_lat = prepare_mask_latents(
+                    vae                = vae,
+                    mask               = mask,
+                    masked_image       = masked_image,
+                    batch_size         = bsz,
+                    num_channels_latents = 16,
+                    num_images_per_prompt = 1,
+                    height             = pixel_values.shape[2],
+                    width              = pixel_values.shape[3],
+                    dtype              = model_input.dtype,
+                    device             = accelerator.device,
+                )
+                masked_img_lat = torch.cat([masked_img_lat, mask_lat], dim=-1)
+
+                # ──────────────────────────────
+                # 4. flow-matching timestep & noise
+                # ──────────────────────────────
+                noise    = torch.randn_like(model_input)
+                u        = compute_density_for_timestep_sampling(
+                    weighting_scheme = args.weighting_scheme,
+                    batch_size       = bsz,
+                    logit_mean       = args.logit_mean,
+                    logit_std        = args.logit_std,
+                    mode_scale       = args.mode_scale,
+                )
+                indices  = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                timesteps = noise_scheduler_copy.timesteps[indices].to(model_input.device)
+
+                sigma    = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                noisy_in = (1.0 - sigma) * model_input + sigma * noise      # z_t
+
+                # ──────────────────────────────
+                # 5. pack latents & ids
+                # ──────────────────────────────
+                packed_noisy = FluxFillPipeline._pack_latents(
+                    noisy_in,
+                    batch_size         = bsz,
+                    num_channels_latents = noisy_in.shape[1],
+                    height             = noisy_in.shape[2],
+                    width              = noisy_in.shape[3],
+                )
+
+                latent_ids = FluxFillPipeline._prepare_latent_image_ids(
+                    bsz,
+                    noisy_in.shape[2] // 2,
+                    noisy_in.shape[3] // 2,
+                    accelerator.device,
+                    weight_dtype,
+                )
+
+                # ──────────────────────────────
+                # 6. forward
+                # ──────────────────────────────
+                if transformer.config.guidance_embeds:
+                    guidance = torch.full((bsz,), args.guidance_scale,
+                                        device=accelerator.device)
+                else:
+                    guidance = None
+
+                pred = transformer(
+                    hidden_states       = torch.cat([packed_noisy, masked_img_lat], dim=2),
+                    timestep            = timesteps / 1000.0,      # scale like original
+                    guidance            = guidance,
+                    pooled_projections  = pooled_embeds,
+                    encoder_hidden_states = prompt_embeds,
+                    txt_ids             = text_ids,
+                    img_ids             = latent_ids,
+                    return_dict         = False,
+                )[0]
+
+                pred = FluxFillPipeline._unpack_latents(
+                    pred,
+                    height            = noisy_in.shape[2] * (2 ** (len(vae_channels)-1)),
+                    width             = noisy_in.shape[3] * (2 ** (len(vae_channels)-1)),
+                    vae_scale_factor  = 2 ** (len(vae_channels)-1),
+                )
+
+                # ──────────────────────────────
+                # 7. loss & backward
+                # ──────────────────────────────
+                weighting = compute_loss_weighting_for_sd3(
+                    weighting_scheme = args.weighting_scheme,
+                    sigmas           = sigma,
+                )
+                target    = noise - model_input
+                loss      = ((weighting * (pred - target) ** 2)
+                            .reshape(bsz, -1)
+                            .mean())
+
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients:
+                    # gradient-clipping (same threshold as original)
+                    accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+
+                optimizer.step(); lr_scheduler.step(); optimizer.zero_grad()
+
+            # ──────────────────────────────
+            # 8. book-keeping
+            # ──────────────────────────────
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                # ─── Periodic checkpoints ───────────────────────────────────────
+                if accelerator.is_main_process and (global_step % args.checkpointing_steps == 0):
+                    # ‣ apply retention limit
+                    if args.checkpoints_total_limit is not None:
+                        ckpts = sorted(
+                            (d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")),
+                            key=lambda x: int(x.split("-")[1]),
+                        )
+                        excess = len(ckpts) - args.checkpoints_total_limit + 1
+                        for old in ckpts[:max(0, excess)]:
+                            shutil.rmtree(os.path.join(args.output_dir, old))
+                            logger.info(f"Removed old checkpoint {old}")
+
+                    ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(ckpt_dir)          # triggers save_model_hook
+                    logger.info(f"Saved checkpoint to {ckpt_dir}")
+
+                # ─── Scalar logs (loss, LR) ─────────────────────────────────────
+                logs = {
+                    "loss": loss.detach().item(),
+                    "lr":   lr_scheduler.get_last_lr()[0],
+                }
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
+
+                # ─── On-the-fly validation images ───────────────────────────────
+                if (
+                    validation_dataloader                                 # comes from accelerator.prepare(...)
+                    and (global_step % args.validation_steps == 0)
+                    and accelerator.is_main_process
+                ):
+                    # rebuild a lightweight pipeline *only* for sampling
+                    pipe = FluxFillPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        transformer = accelerator.unwrap_model(transformer),   # LoRA-augmented
+                        vae         = vae,
+                        torch_dtype = weight_dtype,
+                    )
+                    pipe.load_lora_weights(args.output_dir)        # use current adapters
+                    log_validation(pipe, args, accelerator, validation_dataloader, tag="validation")
+                    del pipe
+                    free_memory()
+
+                # ─── Hard stop ──────────────────────────────────────────────────
+                if global_step >= args.max_train_steps:
+                    break
+
+    # ────────────────────────────────────────────────────────────────────
+    #  FINAL SAVE 
+    # ────────────────────────────────────────────────────────────────────
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        # 1. pull LoRA weights out of the wrapped model
+        lora_state = get_peft_model_state_dict(unwrap_model(transformer).to(weight_dtype))
+
+        # 2. write them to disk
+        FluxFillPipeline.save_lora_weights(
+            save_directory        = args.output_dir,
+            transformer_lora_layers = lora_state,
+        )
+        logger.info(f"LoRA adapters saved to {args.output_dir}")
+
+        # 3. optional final validation pass
+        if validation_dataloader:
+            pipe = FluxFillPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                torch_dtype = weight_dtype,
+            )
+            pipe.load_lora_weights(args.output_dir)
+            log_validation(pipe, args, accelerator, validation_dataloader, tag="test", is_final_validation=True)
+            del pipe; free_memory()
+
+        # 4. push to Hub if requested
+        if args.push_to_hub:
+            upload_folder(
+                repo_id        = repo_id,
+                folder_path    = args.output_dir,
+                commit_message = "End of training",
+                ignore_patterns = ["step_*", "epoch_*"],
+            )
+
+    accelerator.end_training()
+
 
 
 if __name__ == "__main__":
