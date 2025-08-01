@@ -364,7 +364,7 @@ if __name__ == "__main__":
         p.add_argument("--gaussian_blur",    type=float, default=0.8)
         # ---------------- text -------------------
         p.add_argument("--instance_prompt", default="flux-kontext")
-        p.add_argument("--mask_invert",default=True)
+        p.add_argument("--mask_invert",default=False)
         return p.parse_args()
 
     args = get_args()
