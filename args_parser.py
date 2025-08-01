@@ -78,6 +78,7 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
+   
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
@@ -214,6 +215,11 @@ def parse_args(input_args=None):
         "--random_flip",
         action="store_true",
         help="Whether to randomly flip the images during training."
+    )
+    parser.add_argument(
+        "--invert_mask",
+        action="store_true",
+        help="Inverts custom mask if given"
     )
     parser.add_argument(
         "--random_crop",

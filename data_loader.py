@@ -33,7 +33,7 @@ from typing import List, Tuple, Optional, Union
 import torch
 from PIL import Image as PILImage
 from PIL.ImageOps import exif_transpose
-
+from PIL import ImageOps
 from diffusers.training_utils import parse_buckets_string, find_nearest_bucket
 
 from torchvision import transforms
@@ -174,6 +174,7 @@ class PairedImageDataset(Dataset):
         self.random_crop   = args.random_crop
         self.center_crop   = args.center_crop
         self.repeats       = args.repeats
+        self.invert_mask   = args.invert_mask 
 
         self.color_jitter_max = (
             list(map(float, args.color_jitter.split(",")))
@@ -225,6 +226,8 @@ class PairedImageDataset(Dataset):
             if self.mode == "paired":
                 pil_src = exif_transpose(pil_src.convert("RGB"))
             if self.has_mask:
+                if self.invert_mask:
+                    pil_msk = ImageOps.invert(pil_msk)
                 pil_msk = exif_transpose(pil_msk.convert("L"))
 
             w_raw, h_raw = pil_tgt.size
@@ -346,7 +349,7 @@ if __name__ == "__main__":
         p.add_argument("--caption_column",        default="ai_name")
         p.add_argument("--mask_column",           default="mask")
         # ---------------- mode -------------------
-        p.add_argument("--panel_mode",            choices=["paired", "single"], default="paired")
+        p.add_argument("--panel_mode",            choices=["paired", "single"], default="single")
         # ---------------- augs -------------------
         p.add_argument("--resolution", type=int,  default=512)
         p.add_argument("--aspect_ratio_buckets",  default="1184,880")
@@ -359,6 +362,7 @@ if __name__ == "__main__":
         p.add_argument("--gaussian_blur",    type=float, default=0.8)
         # ---------------- text -------------------
         p.add_argument("--instance_prompt", default="flux-kontext")
+        p.add_argument("--invert_mask",     action="store_true", default=True)
         return p.parse_args()
 
     args = get_args()
