@@ -216,6 +216,13 @@ def parse_args(input_args=None):
         help="Whether to randomly flip the images during training."
     )
     parser.add_argument(
+        "--mask_invert",
+        action="store_true",
+        type=bool,
+        default=False,
+        help="whether to invert the mask image during training"
+    )
+    parser.add_argument(
         "--random_crop",
         action="store_true",
         help="Whether to randomly crop the images during training."
