@@ -33,6 +33,7 @@ from typing import List, Tuple, Optional, Union
 import torch
 from PIL import Image as PILImage
 from PIL.ImageOps import exif_transpose
+from PIL.ImageOps import invert
 
 from diffusers.training_utils import parse_buckets_string, find_nearest_bucket
 
@@ -108,6 +109,7 @@ class PairedImageDataset(Dataset):
         instance_prompt
         """
         self.split = split
+        self.mask_invert = args.mask_invert
 
         # -------------------- 0. load dataset -------------------------
         if args.dataset_name is None:
@@ -225,7 +227,10 @@ class PairedImageDataset(Dataset):
             if self.mode == "paired":
                 pil_src = exif_transpose(pil_src.convert("RGB"))
             if self.has_mask:
-                pil_msk = exif_transpose(pil_msk.convert("L"))
+                if self.mask_invert:
+                    pil_msk = exif_transpose(invert(pil_msk.convert("L")))
+                else:
+                    pil_msk = exif_transpose(pil_msk.convert("L"))
 
             w_raw, h_raw = pil_tgt.size
             bucket_idx, (bh, bw) = _pick_bucket(h_raw, w_raw, self.buckets)
@@ -359,6 +364,7 @@ if __name__ == "__main__":
         p.add_argument("--gaussian_blur",    type=float, default=0.8)
         # ---------------- text -------------------
         p.add_argument("--instance_prompt", default="flux-kontext")
+        p.add_argument("--mask_invert",default=False)
         return p.parse_args()
 
     args = get_args()
