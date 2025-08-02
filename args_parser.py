@@ -11,7 +11,21 @@ def parse_args(input_args=None):
             ' (default), `"wandb"` and `"comet_ml"`. Use `"all"` to report to all integrations.'
         ),
     )
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
+    parser.add_argument(
+        "--tracker_project_name",
+        type=str,
+        default="flux-1-fill-in-context-training",
+        help=(
+            "The name of the project to use for tracking. This is used by the `accelerate` library to track the"
+            " training progress and results."
+        ),
+    )
+    parser.add_argument(
+        "--hub_token", 
+        type=str, 
+        default=None, 
+        help="The token to use to push to the Model Hub."
+    )
     parser.add_argument(
         "--mixed_precision",
         type=str,
@@ -44,14 +58,23 @@ def parse_args(input_args=None):
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument(
+        "--seed", 
+        type=int, 
+        default=None, 
+        help="A seed for reproducible training."
+    )
     parser.add_argument(
         "--hub_model_id",
         type=str,
         default=None,
         help="The name of the repository to keep in sync with the local `output_dir`.",
     )
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
+    parser.add_argument(
+        "--push_to_hub", 
+        action="store_true", 
+        help="Whether or not to push the model to the Hub."
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -78,6 +101,7 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
+   
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
@@ -113,7 +137,43 @@ def parse_args(input_args=None):
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        help=(
+            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
+            ' "constant", "constant_with_warmup"]'
+        ),
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", 
+        type=int, 
+        default=500, 
+        help="Number of steps for the warmup in the lr scheduler."
+    )
+    parser.add_argument(
+        "--lr_num_cycles",
+        type=int,
+        default=1,
+        help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
+    )
+    parser.add_argument(
+        "--lr_power", 
+        type=float, 
+        default=1.0, 
+        help="Power factor of the polynomial scheduler."
+    )
+    parser.add_argument(
+        "--train_batch_size", 
+        type=int, 
+        default=1, 
+        help="Batch size (per device) for the training dataloader."
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="For LR scaling.",
     )
     parser.add_argument(
         "--optimizer",
@@ -205,6 +265,16 @@ def parse_args(input_args=None):
         help="The prompt with identifier specifying the instance, e.g. 'photo of a TOK dog', 'in the style of TOK'",
     )
     parser.add_argument(
+        "--caption_template",
+        type=str,
+        default=None,
+        help=(
+            "Optional Python-format string. If given, the loader will build the "
+            "prompt with `caption_template.format(cap=<caption_cell>)`. "
+            "Example: 'A DSLR photo of {cap} wearing streetwear'"
+        ),
+    )
+    parser.add_argument(
         "--aspect_ratio_buckets",
         type=str,
         default="1184,880",
@@ -214,6 +284,11 @@ def parse_args(input_args=None):
         "--random_flip",
         action="store_true",
         help="Whether to randomly flip the images during training."
+    )
+    parser.add_argument(
+        "--invert_mask",
+        action="store_true",
+        help="Inverts custom mask if given"
     )
     parser.add_argument(
         "--random_crop",
@@ -246,20 +321,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--random_grayscale",
         type=float, 
-        default=0.7,
+        default=0.1,
         help="The probability of converting the image to grayscale during training."
     )
     parser.add_argument(
         "--gaussian_blur",
         type=float, 
-        default=0.8,    
+        default=0,    
         help="max sigma (0 = off)"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size (per device) for the training dataloader. This is the effective batch size, which is the product of the per-device batch size and the number of devices.",
     )
     parser.add_argument(
         "--max_sequence_length",
@@ -280,10 +349,16 @@ def parse_args(input_args=None):
         help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
     )
     parser.add_argument(
-        "--logit_mean", type=float, default=0.0, help="mean to use when using the `'logit_normal'` weighting scheme."
+        "--logit_mean", 
+        type=float, 
+        default=0.0, 
+        help="mean to use when using the `'logit_normal'` weighting scheme."
     )
     parser.add_argument(
-        "--logit_std", type=float, default=1.0, help="std to use when using the `'logit_normal'` weighting scheme."
+        "--logit_std", 
+        type=float, 
+        default=1.0, 
+        help="std to use when using the `'logit_normal'` weighting scheme."
     )
     parser.add_argument(
         "--mode_scale",
@@ -298,6 +373,33 @@ def parse_args(input_args=None):
         help="Cache the VAE latents",
     )
     parser.add_argument(
+        "--val_split",
+        type=str,
+        default="test",          # or "test" if that’s what your dataset uses
+        help=(
+            "Which split to load for validation. "
+            "Typical options are `validation`, `test`, or a custom named split."
+        ),
+    )
+    parser.add_argument(
+        "--validation_steps", 
+        type=int, 
+        default=5, 
+        help="Run validation every X steps."
+    )
+    parser.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=1,
+        help="Total number of training epochs to perform. If the dataset is small, you may want to increase this.",
+    )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=30000,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
         "--checkpointing_steps",
         type=int,
         default=2000,
@@ -308,13 +410,31 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--val_split",
+        "--checkpoints_total_limit",
+        type=int,
+        default=None,
+        help=("Max number of checkpoints to store."),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
         type=str,
-        default="test",          # or "test" if that’s what your dataset uses
+        default=None,
         help=(
-            "Which split to load for validation. "
-            "Typical options are `validation`, `test`, or a custom named split."
+            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.5,
+        help="the FLUX.1 dev variant is a guidance distilled model",
+    )
+    parser.add_argument(
+        "--max_grad_norm", 
+        default=1.0, 
+        type=float, 
+        help="Max gradient norm."
     )
 
     if input_args is not None:
