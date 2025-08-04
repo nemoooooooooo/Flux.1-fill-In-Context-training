@@ -339,10 +339,16 @@ def main(args):
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=6,
+        num_workers=4,
+        persistent_workers=True,
         collate_fn=collate_fn,
     )
-    dl_val = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    dl_val = DataLoader(
+        val_ds, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        collate_fn=collate_fn
+    )
 
     latents_cache = None
     if args.cache_latents:
@@ -395,6 +401,9 @@ def main(args):
     # ---- sched & epoch math ------------------------------------------
     steps_per_epoch = math.ceil(len(dl_train) / args.gradient_accumulation_steps)
     max_steps = args.max_train_steps or args.num_train_epochs * steps_per_epoch
+    if args.num_train_epochs is None or args.num_train_epochs <= 0:
+        args.num_train_epochs = math.ceil(max_steps / steps_per_epoch)
+
     lr_sched = get_scheduler(
         args.lr_scheduler,
         optimizer,
@@ -444,6 +453,8 @@ def main(args):
     # ------------------------------------------------------------------
     # Training loop -----------------------------------------------------
     # ------------------------------------------------------------------
+
+
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         for step, batch in enumerate(dl_train):
@@ -507,7 +518,7 @@ def main(args):
                     guidance=guidance,
                     pooled_projections=pooled_emb,
                     encoder_hidden_states=prompt_emb,
-                    txt_ids=txt_ids,  # ← full tensor, **no slicing**
+                    txt_ids = txt_ids.reshape(-1, 3), 
                     img_ids=latent_ids,
                     return_dict=False,
                 )[0]
