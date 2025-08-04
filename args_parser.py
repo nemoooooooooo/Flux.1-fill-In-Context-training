@@ -384,13 +384,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_steps", 
         type=int, 
-        default=5, 
+        default=1000, 
         help="Run validation every X steps."
     )
     parser.add_argument(
         "--num_train_epochs",
         type=int,
-        default=1,
+        default=30,
         help="Total number of training epochs to perform. If the dataset is small, you may want to increase this.",
     )
     parser.add_argument(
