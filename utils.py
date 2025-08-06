@@ -2,10 +2,82 @@ from transformers import PretrainedConfig
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, FluxFillPipeline
 from typing import Union, Optional
+import json
+from pathlib import Path
+
+MODE_FNAME = "training_mode.json"
+
+def write_mode_marker(dirpath: str | Path, mode: str):
+    p = Path(dirpath) / MODE_FNAME
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump({"train_mode": mode}, f)
+
+def read_mode_marker(dirpath: str | Path) -> str | None:
+    p = Path(dirpath) / MODE_FNAME
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f).get("train_mode")
+        except Exception:
+            return None
+    # Fallback heuristics for older checkpoints (no marker file)
+    if (Path(dirpath) / "transformer").is_dir():
+        return "base"
+    # common LoRA file names written by diffusers/peft
+    for fn in [
+        "pytorch_lora_weights.safetensors",
+        "adapter_model.safetensors",
+        "transformer_lora_layers.safetensors",
+    ]:
+        if (Path(dirpath) / fn).exists():
+            return "lora"
+    return None
 
 
+def enable_trainables_by_name(transformer, prefixes_str, includes_str, logger=None, is_main_process=True):
+    """
+    Enable grads for parameters whose names:
+      1) start with any prefix in prefixes_str (comma-separated)
+      2) contain any substring in includes_str (comma-separated)
+    Everything else is frozen.
+    Returns (selected_names, total_params_enabled).
+    """
+    prefixes = [p.strip() for p in prefixes_str.split(",") if p.strip()]
+    includes = [i.strip() for i in includes_str.split(",") if i.strip()]
 
+    def matches(name: str) -> bool:
+        return any(name.startswith(pref) for pref in prefixes) and any(inc in name for inc in includes)
 
+    selected, total = [], 0
+    for n, p in transformer.named_parameters():
+        if matches(n):
+            p.requires_grad_(True)
+            selected.append((n, p.numel()))
+            total += p.numel()
+        else:
+            p.requires_grad_(False)
+
+    # Optional: warn if nothing matched
+    if is_main_process and len(selected) == 0:
+        msg = (
+            "[enable_trainables_by_name] No parameters matched your filters. "
+            f"prefixes={prefixes} includes={includes}"
+        )
+        print(msg) if logger is None else logger.warning(msg)
+
+    if is_main_process:
+        header = f"Enabled {len(selected)} tensors · {total/1e6:.3f} M params"
+        if logger is None:
+            print(header)
+            for n, k in selected:
+                print(f"  ✓ {n} ({k/1e3:.1f}K)")
+        else:
+            logger.info(header)
+            for n, k in selected:
+                logger.info(f"  ✓ {n} ({k/1e3:.1f}K)")
+
+    return [n for n, _ in selected], total
 
 def retrieve_latents(
     encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"

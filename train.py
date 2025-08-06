@@ -40,6 +40,9 @@ from utils import (
     import_model_class_from_model_name_or_path,
     load_text_encoders,
     prepare_mask_latents,
+    enable_trainables_by_name,
+    write_mode_marker,
+    read_mode_marker
 )
 
 if is_wandb_available():
@@ -236,29 +239,49 @@ def main(args):
         transformer.enable_gradient_checkpointing()
 
     # ------------------------------------------------------------------
-    # Add LoRA to chosen modules ---------------------------------------
+    # Select trainables by mode
     # ------------------------------------------------------------------
-    if args.lora_layers:
-        targets = [x.strip() for x in args.lora_layers.split(",")]
-    else:
-        targets = [
-            "attn.to_k",
-            "attn.to_q",
-            "attn.to_v",
-            "attn.to_out.0",
-            "attn.add_k_proj",
-            "attn.add_q_proj",
-            "attn.add_v_proj",
-            "attn.to_add_out",
-            "ff.net.0.proj",
-            "ff.net.2",
-            "ff_context.net.0.proj",
-            "ff_context.net.2",
+    if args.train_mode == "lora":
+        targets = [x.strip() for x in args.lora_layers.split(",")] if args.lora_layers else [
+            "attn.to_k", "attn.to_q", "attn.to_v", "attn.to_out.0",
+            "attn.add_k_proj", "attn.add_q_proj", "attn.add_v_proj", "attn.to_add_out",
+            "ff.net.0.proj", "ff.net.2", "ff_context.net.0.proj", "ff_context.net.2",
         ]
+        transformer.add_adapter(
+            LoraConfig(r=args.rank, lora_alpha=args.rank, init_lora_weights="gaussian", target_modules=targets)
+        )
 
-    transformer.add_adapter(
-        LoraConfig(r=args.rank, lora_alpha=args.rank, init_lora_weights="gaussian", target_modules=targets)
-    )
+        # LoRA injects trainable params for you
+        trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+        if accelerator.is_main_process:
+            print(f"[LoRA] trainable tensors: {len(trainable_params)} "
+                f"({sum(p.numel() for p in trainable_params)/1e6:.3f} M params)")
+
+    else:
+        # Base FT: enable grads only on names that start with prefixes and contain includes
+        enabled_names, total_numel = enable_trainables_by_name(
+            transformer,
+            prefixes_str=args.trainable_name_prefixes,   # e.g. "transformer_blocks.,single_transformer_blocks."
+            includes_str=args.train_includes,            # e.g. "attn"
+            logger=logger if 'logger' in globals() else None,
+            is_main_process=accelerator.is_main_process if 'accelerator' in globals() else True,
+        )
+        trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+
+        # hard fail if nothing matched (prevents “silent no-training” sessions)
+        if len(trainable_params) == 0:
+            raise RuntimeError(
+                f"No parameters matched prefixes={args.trainable_name_prefixes} "
+                f"and includes={args.train_includes}"
+            )
+
+        if accelerator.is_main_process:
+            print(f"[BASE] trainable tensors: {len(trainable_params)} "
+                f"({sum(p.numel() for p in trainable_params)/1e6:.3f} M params)")
+            # Also print the names that were enabled
+            for n in enabled_names:
+                print("  ✓", n)
+
 
     def unwrap(model):
         m = accelerator.unwrap_model(model)
@@ -272,24 +295,45 @@ def main(args):
             return
         for m in models:
             if isinstance(m, type(unwrap(transformer))):
-                lora_state = get_peft_model_state_dict(m)
-                FluxFillPipeline.save_lora_weights(out_dir, transformer_lora_layers=lora_state)
-            # pop to avoid double‑save
+                if args.train_mode == "lora":
+                    lora_state = get_peft_model_state_dict(m)
+                    FluxFillPipeline.save_lora_weights(out_dir, transformer_lora_layers=lora_state)
+                else:
+                    # save full transformer weights only
+                    unwrap(transformer).save_pretrained(os.path.join(out_dir, "transformer"), max_shard_size="50GB")
             _ = _.pop()
+        write_mode_marker(out_dir, args.train_mode)
+
 
     def load_hook(models, in_dir):
+        saved_mode = read_mode_marker(in_dir)
+        if saved_mode is not None and saved_mode != args.train_mode:
+            raise RuntimeError(
+                f"Mismatched training mode for load_hook: checkpoint directory indicates '{saved_mode}', "
+                f"but current run is '{args.train_mode}'."
+            )
+
         while models:
             mdl = models.pop()
             if isinstance(mdl, type(unwrap(transformer))):
-                state = FluxFillPipeline.lora_state_dict(in_dir)
-                state = {k.replace("transformer.", ""): v for k, v in state.items() if k.startswith("transformer.")}
-                state = convert_unet_state_dict_to_peft(state)
-                set_peft_model_state_dict(mdl, state, adapter_name="default")
+                if args.train_mode == "lora":
+                    state = FluxFillPipeline.lora_state_dict(in_dir)
+                    state = {k.replace("transformer.", ""): v for k, v in state.items() if k.startswith("transformer.")}
+                    state = convert_unet_state_dict_to_peft(state)
+                    set_peft_model_state_dict(mdl, state, adapter_name="default")
+                else:
+                    loaded = FluxTransformer2DModel.from_pretrained(in_dir, subfolder="transformer")
+                    mdl.register_to_config(**loaded.config)
+                    mdl.load_state_dict(loaded.state_dict(), strict=True)
+                    del loaded
+
+                if args.mixed_precision == "fp16":
+                    cast_training_params([mdl])
+
             else:
                 raise ValueError("unexpected model type during load")
 
-        if args.mixed_precision == "fp16":
-            cast_training_params([mdl])
+
 
     accelerator.register_save_state_pre_hook(save_hook)
     accelerator.register_load_state_pre_hook(load_hook)
@@ -305,8 +349,7 @@ def main(args):
             * accelerator.num_processes
         )
 
-    lora_params = [p for p in transformer.parameters() if p.requires_grad]
-    optim_groups = [{"params": lora_params, "lr": args.learning_rate}]
+    optim_groups = [{"params": trainable_params, "lr": args.learning_rate}]
 
     if args.optimizer.lower() == "adamw":
         if args.use_8bit_adam:
@@ -350,19 +393,6 @@ def main(args):
         collate_fn=collate_fn
     )
 
-    latents_cache = None
-    if args.cache_latents:
-        logger.info("Caching latents …")
-        latents_cache = []
-        for batch in tqdm(dl_train, desc="encode VAE", disable=not accelerator.is_local_main_process):
-            with torch.no_grad():
-                imgs = batch["pixel_values"].to(accelerator.device, dtype=vae.dtype, non_blocking=True)
-                lat  = vae.encode(imgs).latent_dist          
-                latents_cache.append(lat)
-        # If you never need the VAE again you can free it when caching is on
-        if args.validation_steps is None:   # keep VAE for val if you still need it
-            del vae
-            free_memory()
 
     # ---- prompt caching ----------------------------------------------
     def compute_prompt_emb(prompt: Union[str, List[str]]):
@@ -429,10 +459,22 @@ def main(args):
             else max((p for p in os.listdir(args.output_dir) if p.startswith("checkpoint-")), default=None)
         )
         if ckpt_name:
-            accelerator.load_state(os.path.join(args.output_dir, ckpt_name))
+            ckpt_dir = Path(args.output_dir) / ckpt_name
+
+            # <<< add this guard
+            saved_mode = read_mode_marker(ckpt_dir)
+            if saved_mode is not None and saved_mode != args.train_mode:
+                raise RuntimeError(
+                    f"Mismatched training mode for resume: checkpoint '{ckpt_name}' was saved as '{saved_mode}', "
+                    f"but current run is '{args.train_mode}'.\n"
+                    f"Use a matching checkpoint or switch --train_mode."
+                )
+
+            accelerator.load_state(str(ckpt_dir))
             global_step = int(ckpt_name.split("-")[1])
             first_epoch = global_step // steps_per_epoch
             logger.info(f"Resumed from {ckpt_name}")
+
 
     prog = tqdm(range(global_step, max_steps), disable=not accelerator.is_local_main_process, desc="Steps")
 
@@ -536,7 +578,7 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step(); lr_sched.step(); optimizer.zero_grad()
 
             # bookkeeping ------------------------------------------------
@@ -576,7 +618,7 @@ def main(args):
                 ):
                     pipe = FluxFillPipeline.from_pretrained(
                         args.pretrained_model_name_or_path,
-                        transformer=accelerator.unwrap_model(transformer),  # live LoRA
+                        transformer=accelerator.unwrap_model(transformer),  # live LoRA if applicable
                         vae=vae,
                         torch_dtype=weight_dtype,
                     )
@@ -595,15 +637,30 @@ def main(args):
     # ------------------------------------------------------------------
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        lora_state = get_peft_model_state_dict(unwrap(transformer).to(weight_dtype))
-        FluxFillPipeline.save_lora_weights(args.output_dir, transformer_lora_layers=lora_state)
-        logger.info(f"LoRA adapters saved to {args.output_dir}")
+        if args.train_mode == "lora":
+            lora_state = get_peft_model_state_dict(unwrap(transformer).to(weight_dtype))
+            FluxFillPipeline.save_lora_weights(args.output_dir, transformer_lora_layers=lora_state)
+        else:
+            unwrap(transformer).save_pretrained(os.path.join(args.output_dir, "transformer"))
+
+        write_mode_marker(args.output_dir, args.train_mode)
 
         if dl_val is not None:
-            pipe = FluxFillPipeline.from_pretrained(
-                args.pretrained_model_name_or_path, torch_dtype=weight_dtype
-            )
-            pipe.load_lora_weights(args.output_dir)  # file now exists
+            if args.train_mode == "lora":
+                pipe = FluxFillPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path, torch_dtype=weight_dtype
+                )
+                pipe.load_lora_weights(args.output_dir)
+            else:
+                # Load the freshly saved base transformer
+                tuned_tx = FluxTransformer2DModel.from_pretrained(
+                    args.output_dir, subfolder="transformer", torch_dtype=weight_dtype
+                )
+                pipe = FluxFillPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    transformer=tuned_tx,
+                    torch_dtype=weight_dtype,
+                )
             log_validation(pipe, args, accelerator, dl_val, tag="test")
             del pipe; free_memory()
 

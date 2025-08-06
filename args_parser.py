@@ -1,4 +1,5 @@
 import argparse
+import logging
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple training script.")
@@ -101,7 +102,6 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
-   
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
@@ -162,12 +162,6 @@ def parse_args(input_args=None):
         type=float, 
         default=1.0, 
         help="Power factor of the polynomial scheduler."
-    )
-    parser.add_argument(
-        "--train_batch_size", 
-        type=int, 
-        default=1, 
-        help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
         "--batch_size",
@@ -367,12 +361,6 @@ def parse_args(input_args=None):
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
     parser.add_argument(
-        "--cache_latents",
-        action="store_true",
-        default=False,
-        help="Cache the VAE latents",
-    )
-    parser.add_argument(
         "--val_split",
         type=str,
         default="test",          # or "test" if that’s what your dataset uses
@@ -436,10 +424,30 @@ def parse_args(input_args=None):
         type=float, 
         help="Max gradient norm."
     )
+    parser.add_argument(
+        "--train_mode", 
+        choices=["lora", "base"], 
+        default="lora"
+    )
+    parser.add_argument(
+        "--trainable_name_prefixes",
+        type=str,
+        default="transformer_blocks.,single_transformer_blocks.",
+        help="Comma-separated prefixes; only names starting with these are considered when train_mode=base."
+    )
+    parser.add_argument(
+        "--train_includes",
+        type=str,
+        default="attn",
+        help="Comma-separated substrings; after prefix match, name must contain ANY of these."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
+
+    if args.train_mode == "base" and args.lora_layers:
+        logging.warning("--lora_layers is set but train_mode=base; ignoring.")
 
     return args
