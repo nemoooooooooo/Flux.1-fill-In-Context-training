@@ -1,29 +1,30 @@
 levels:
-  - name: lvl1
-    difficulty_blur_sigma: 4.0      # σ for cv2.GaussianBlur
-    difficulty_gray_alpha: 0.20     # 0 = full colour, 1 = full gray
+ - name: lvl1
+   difficulty_blur_sigma: 20       # σ for cv2.GaussianBlur
+   difficulty_gray_alpha: 0.00     # 0 = full colour, 1 = full gray
+   difficulty_brightness: 50       # brightness adjustment value
 
-  - name: lvl2
-    difficulty_blur_sigma: 9.0
-    difficulty_gray_alpha: 0.40
+ - name: lvl2
+   difficulty_blur_sigma: 50
+   difficulty_gray_alpha: 0.25
+   difficulty_brightness: 60
 
-  - name: lvl3
-    difficulty_blur_sigma: 16
-    difficulty_gray_alpha: 0.60
+ - name: lvl3
+   difficulty_blur_sigma: 80
+   difficulty_gray_alpha: 0.80
+   difficulty_brightness: 80
 
-  - name: lvl4
-    difficulty_blur_sigma: 24
-    difficulty_gray_alpha: 0.80
+ - name: lvl4
+   difficulty_blur_sigma: 100
+   difficulty_gray_alpha: 1
+   difficulty_brightness: 100
 
-  - name: lvl5
-    difficulty_blur_sigma: 35
-    difficulty_gray_alpha: 1.00
+ - name: lvl5
+   difficulty_blur_sigma: 100
+   difficulty_gray_alpha: 1.00
+   difficulty_brightness: 200
 
-  - name: lvl6
-    difficulty_blur_sigma: 55
-    difficulty_gray_alpha: 1.00
-
-promote_threshold : 0.55   # ≥55 % “better or equal” votes → promote
+promote_threshold : 0.55   # ≥55 % "better or equal" votes → promote
 repeat_backoff    : 0.75   # on plain repeat (not failure) multiply σ & α by 0.75
 fail_halve_factor : 0.50   # on failed graduation create sub-level with σ,α × 0.50
 val_every_steps   : 500    # run hard validation every 500 optimiser steps
