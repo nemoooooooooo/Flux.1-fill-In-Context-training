@@ -41,25 +41,36 @@ def masked_bg_gray_blur_batch_uint8(
     src_u8: torch.Tensor,    # [B,3,H,W] uint8 on device
     m_u8: torch.Tensor,      # [B,1,H,W] uint8 on device (0..255)
     kx, ky, radius: int,
-    alpha: float
+    alpha: float,
+    brightness: float,       # NEW: brightness in the same scale as your YAML (0..200 per example)
 ) -> torch.Tensor:
     """
-    out = where(mask<128, src, alpha*gray(blur(src)) + (1-alpha)*blur(src))
+    out = where(mask<128, src, brightness_adjust( mix(gray(blur(src)), blur(src), alpha) ))
+    Brightness adjust emulates: cv2.convertScaleAbs(result, alpha=1.0, beta=(brightness-50)*2.55)
     """
+    # Normalize to [0,1]
     x = src_u8.to(torch.float32) / 255.0
-    m = (m_u8.to(torch.float32) < 128.0).to(torch.float32)  # 1 where KEEP (watch), else 0
+    m = (m_u8.to(torch.float32) < 128.0).to(torch.float32)  # 1 where KEEP original, else 0
 
+    # --- Gaussian blur (separable) ---
     xw = F.pad(x, (radius, radius, 0, 0), mode="reflect")
     h  = F.conv2d(xw, kx, groups=3)
     xh = F.pad(h, (0, 0, radius, radius), mode="reflect")
     blurred = F.conv2d(xh, ky, groups=3)
 
+    # --- Grayscale mix (alpha: 0=full color, 1=full gray) ---
     r, g, b = blurred[:, 0:1], blurred[:, 1:2], blurred[:, 2:3]
     gray3 = (0.299 * r + 0.587 * g + 0.114 * b).repeat(1, 3, 1, 1)
-    bg = gray3 * float(alpha) + blurred * (1.0 - float(alpha))
+    mixed = gray3 * float(alpha) + blurred * (1.0 - float(alpha))
 
+    # --- Brightness adjust like OpenCV convertScaleAbs with beta=(brightness-50)*2.55 ---
+    beta_u8 = (float(brightness) - 50.0) * 2.55   # shift in [uint8] space
+    beta = beta_u8 / 255.0                        # convert to [0..1] space
+    processed = (mixed + beta).clamp(0.0, 1.0)
+
+    # --- Compose with original using mask ---
     m3 = m.repeat(1, 3, 1, 1)
-    out = m3 * x + (1.0 - m3) * bg
+    out = m3 * x + (1.0 - m3) * processed
     out = (out.clamp(0, 1) * 255.0).round().to(torch.uint8)
     return out
 
@@ -136,6 +147,7 @@ def build_level_dataset_fast_masked(
     writer_threads: int = 8,
 ) -> Path:
     cache_root = Path(cache_root); cache_root.mkdir(parents=True, exist_ok=True)
+    # NOTE: keep UID the same shape as before (no brightness in key) so paths/preview behavior stay identical
     key = {
         "name": level["name"],
         "sigma": float(level["difficulty_blur_sigma"]),
@@ -177,6 +189,7 @@ def build_level_dataset_fast_masked(
 
     sigma = float(level["difficulty_blur_sigma"])
     alpha = float(level["difficulty_gray_alpha"])
+    brightness = float(level.get("difficulty_brightness", 50.0))  # default 50 like your OpenCV example
     kx, ky, radius = gaussian_kernels_1d(sigma, device)
 
     executor = ThreadPoolExecutor(max_workers=writer_threads)
@@ -192,7 +205,9 @@ def build_level_dataset_fast_masked(
         for idxs, batch_u8, masks_u8, sizes in loader:
             batch_u8 = batch_u8.to(device, non_blocking=True)   # [B,3,H,W]
             masks_u8 = masks_u8.to(device, non_blocking=True)   # [B,1,H,W]
-            out_u8 = masked_bg_gray_blur_batch_uint8(batch_u8, masks_u8, kx, ky, radius, alpha).cpu()
+            out_u8 = masked_bg_gray_blur_batch_uint8(
+                batch_u8, masks_u8, kx, ky, radius, alpha, brightness
+            ).cpu()
 
             for i in range(out_u8.size(0)):
                 h, w = sizes[i].tolist()
