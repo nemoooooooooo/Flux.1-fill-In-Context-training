@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import gradio as gr
-from PIL import Image  # added for right-half cropping
+from PIL import Image
 
 IDX_RE = re.compile(r"val_(\d+)_result\.(png|jpg|jpeg)$", re.IGNORECASE)
 
@@ -60,18 +60,21 @@ def build_order(dir_a: Path, dir_b: Path, shuffle: bool) -> List[int]:
         random.Random(1337).shuffle(idxs)
     return idxs
 
-def stats_md(votes: Dict[int, str], total_pairs: int) -> str:
-    # Only count rated (exclude "skip")
+def stats_md(votes: Dict[int, str], total_pairs: int, current_pos: int) -> str:
+    # Count all votes (no skips allowed anymore)
     rated = {k: v for k, v in votes.items() if v in ("A", "B", "T")}
     better = sum(1 for v in rated.values() if v == "B")  # B=next level better
     worse  = sum(1 for v in rated.values() if v == "A")
     tie    = sum(1 for v in rated.values() if v == "T")
-    skipped= sum(1 for v in votes.values() if v == "S")
 
     denom = max(1, len(rated))
     promo_score = (better + tie) / denom
+    
+    # Show current position (1-indexed for user friendliness)
+    current_display = min(current_pos + 1, total_pairs)
+    
     return (
-        f"**Progress:** {len(rated)}/{total_pairs} rated  |  **Skipped:** {skipped}\n\n"
+        f"**Current:** {current_display}/{total_pairs}  |  **Rated:** {len(rated)}/{total_pairs}\n\n"
         f"**A better:** {worse}   |   **Tie:** {tie}   |   **B better:** {better}\n\n"
         f"**Promotion score** = (B + Tie) / Rated = **{promo_score:.1%}**"
     )
@@ -92,11 +95,11 @@ def save_results(out_path: Path,
         "val_dir_b": str(dir_b),
         "order": idx_order,
         "votes": {str(k): v for k, v in votes.items()},  # raw per-index votes
-        "total_comparisons": len(rated),                 # only rated (no skips)
+        "total_comparisons": len(rated),                 # only rated
         "better_count": better,
         "worse_count": worse,
         "neutral_count": tie,
-        "skipped_count": sum(1 for v in votes.values() if v == "S"),
+        "skipped_count": 0,  # No skips allowed
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +126,7 @@ def make_app(args):
 
     with gr.Blocks(title=f"Compare: {args.name_a} vs {args.name_b}") as demo:
         gr.Markdown(f"### Human evaluation: **{args.name_a} (A)** vs **{args.name_b} (B)**")
-        gr.Markdown("Choose which result looks better. “Tie” if about the same. You can skip and come back later.")
+        gr.Markdown("Choose which result looks better or mark as 'Tie' if about the same. All images must be rated.")
 
         state_idx_order = gr.State(idx_order)   # List[int]
         state_pos       = gr.State(start_pos)   # int pointer into idx_order
@@ -138,33 +141,41 @@ def make_app(args):
                 src = gr.Image(label="Source", interactive=False, height=200)
                 msk = gr.Image(label="Mask", interactive=False, height=200)
 
-        stat = gr.Markdown(stats_md({}, total_pairs))
+        stat = gr.Markdown(stats_md({}, total_pairs, start_pos))
 
         with gr.Row():
             btn_back  = gr.Button("⬅️ Back")
-            btn_a     = gr.Button("A is better")
-            btn_tie   = gr.Button("Tie / About same")
-            btn_b     = gr.Button("B is better")
-            btn_skip  = gr.Button("Skip ➡️")
+            btn_a     = gr.Button("A is better", variant="secondary")
+            btn_tie   = gr.Button("Tie / About same", variant="secondary")
+            btn_b     = gr.Button("B is better", variant="secondary")
+            btn_next  = gr.Button("Next (unrated) ➡️")
         with gr.Row():
             btn_finish = gr.Button("✅ Finish & Save", variant="primary")
             save_path  = gr.Textbox(value=str(Path(args.out).resolve()), label="Results will be saved to", interactive=False)
+        
+        # Add status text to show warnings
+        status_text = gr.Markdown("")
 
         def _right_half(p):
+            """Extract exactly the right half of the image"""
             if p is None:
                 return None
             try:
                 im = Image.open(p)
                 try:
                     w, h = im.size
-                    cropped = im.crop((w // 2, 0, w, h)).copy()
+                    # Calculate exact half point
+                    half_w = w // 2
+                    # Crop from exact half to end
+                    cropped = im.crop((half_w, 0, w, h))
                     return cropped
                 finally:
                     try:
                         im.close()
                     except Exception:
                         pass
-            except Exception:
+            except Exception as e:
+                print(f"Error cropping image {p}: {e}")
                 # Fallback: if anything goes wrong, return the original path
                 return str(p)
 
@@ -180,35 +191,75 @@ def make_app(args):
                     str(ma) if ma else None)
 
         def _go(idx_order, pos, votes, move):
-            # move ∈ {"A", "B", "T", "S", "BACK", "INIT"}
-            if move in ("A", "B", "T", "S"):
+            # move ∈ {"A", "B", "T", "NEXT", "BACK", "INIT"}
+            status = ""
+            
+            if move in ("A", "B", "T"):
                 idx = idx_order[pos]
                 votes[idx] = move
-                pos = min(len(idx_order)-1, pos + 1)
+                # Auto-advance to next if not at end
+                if pos < len(idx_order) - 1:
+                    pos = pos + 1
+                else:
+                    status = "✅ All images rated! Click 'Finish & Save' to complete."
+            elif move == "NEXT":
+                # Find next unrated position
+                found_unrated = False
+                for i in range(pos + 1, len(idx_order)):
+                    if idx_order[i] not in votes:
+                        pos = i
+                        found_unrated = True
+                        break
+                if not found_unrated:
+                    # Wrap around to find any unrated from beginning
+                    for i in range(0, pos):
+                        if idx_order[i] not in votes:
+                            pos = i
+                            found_unrated = True
+                            break
+                if not found_unrated:
+                    status = "✅ All images rated! Click 'Finish & Save' to complete."
             elif move == "BACK":
                 pos = max(0, pos - 1)
             else:
-                pass
+                pass  # INIT or other
 
             pa, pb, sa, ma = _load(idx_order, pos)
-            md = stats_md(votes, len(idx_order))
-            return pa, pb, sa, ma, pos, votes, md
+            md = stats_md(votes, len(idx_order), pos)
+            
+            # Check if current image is already rated
+            current_idx = idx_order[pos]
+            if current_idx in votes:
+                status += f" (Current image already rated: {votes[current_idx]})"
+            
+            return pa, pb, sa, ma, pos, votes, md, status
 
         # wire up events
-        for button, code in ((btn_a,"A"), (btn_b,"B"), (btn_tie,"T"), (btn_skip,"S")):
+        for button, code in ((btn_a,"A"), (btn_b,"B"), (btn_tie,"T")):
             button.click(
                 _go,
                 inputs=[state_idx_order, state_pos, state_votes, gr.State(code)],
-                outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat],
+                outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat, status_text],
             )
 
         btn_back.click(
             _go,
             inputs=[state_idx_order, state_pos, state_votes, gr.State("BACK")],
-            outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat],
+            outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat, status_text],
+        )
+        
+        btn_next.click(
+            _go,
+            inputs=[state_idx_order, state_pos, state_votes, gr.State("NEXT")],
+            outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat, status_text],
         )
 
         def _save_and_exit(idx_order, votes):
+            # Check if all images are rated
+            unrated = [idx for idx in idx_order if idx not in votes or votes[idx] not in ("A", "B", "T")]
+            if unrated:
+                return f"⚠️ Cannot save: {len(unrated)} images still unrated. Please rate all images before finishing."
+            
             data = save_results(Path(args.out), args.name_a, args.name_b, dir_a, dir_b, idx_order, votes)
             # try to close server shortly after save
             def _shutdown():
@@ -221,19 +272,19 @@ def make_app(args):
                 # ensure exit if close_all isn't available
                 os._exit(0)
             threading.Timer(1.0, _shutdown).start()
-            return f"Saved. better={data['better_count']}, tie={data['neutral_count']}, worse={data['worse_count']}. Exiting..."
+            return f"✅ Saved. better={data['better_count']}, tie={data['neutral_count']}, worse={data['worse_count']}. Exiting..."
 
         btn_finish.click(
             _save_and_exit,
             inputs=[state_idx_order, state_votes],
-            outputs=[stat],
+            outputs=[status_text],
         )
 
         # initial load
         demo.load(
             _go,
             inputs=[state_idx_order, state_pos, state_votes, gr.State("INIT")],
-            outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat],
+            outputs=[img_a, img_b, src, msk, state_pos, state_votes, stat, status_text],
         )
 
     return demo
