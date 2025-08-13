@@ -45,6 +45,7 @@ class DifficultyLevel:
     level_index: int = 0
     is_sublevel: bool = False
     parent_level: Optional[str] = None
+    val_every_steps: Optional[int] = None  # Per-level validation steps
     
     def to_dict(self):
         return asdict(self)
@@ -118,7 +119,7 @@ class CurriculumManager:
         self.promote_threshold = self.levels_config.get("promote_threshold", 0.55)
         self.repeat_backoff = self.levels_config.get("repeat_backoff", 0.75)
         self.fail_halve_factor = self.levels_config.get("fail_halve_factor", 0.5)
-        self.val_every_steps = self.levels_config.get("val_every_steps", 500)
+        self.default_val_every_steps = self.levels_config.get("val_every_steps", 500)  # Default fallback
         self.max_validation_samples = self.levels_config.get("max_validation_samples", None)
         self.max_retries = self.levels_config.get("max_retries", 3)
         
@@ -181,7 +182,8 @@ class CurriculumManager:
                     difficulty_brightness=level_dict.get('difficulty_brightness', 50.0),
                     level_index=level_dict['level_index'],
                     is_sublevel=level_dict.get('is_sublevel', False),
-                    parent_level=level_dict.get('parent_level', None)
+                    parent_level=level_dict.get('parent_level', None),
+                    val_every_steps=level_dict.get('val_every_steps', None)
                 )
                 self.levels.append(level)
             
@@ -195,7 +197,8 @@ class CurriculumManager:
                     difficulty_brightness=bl.get('difficulty_brightness', 50.0),
                     level_index=bl['level_index'],
                     is_sublevel=bl.get('is_sublevel', False),
-                    parent_level=bl.get('parent_level', None)
+                    parent_level=bl.get('parent_level', None),
+                    val_every_steps=bl.get('val_every_steps', None)
                 )
             else:
                 self.baseline_level = None
@@ -221,7 +224,8 @@ class CurriculumManager:
                 difficulty_blur_sigma=level_data["difficulty_blur_sigma"],
                 difficulty_gray_alpha=level_data["difficulty_gray_alpha"],
                 difficulty_brightness=level_data.get("difficulty_brightness", 50.0),
-                level_index=idx
+                level_index=idx,
+                val_every_steps=level_data.get("val_every_steps", None)  # Get per-level steps
             )
             levels.append(level)
         return levels
@@ -229,6 +233,12 @@ class CurriculumManager:
     def get_current_level(self) -> DifficultyLevel:
         """Get current difficulty level"""
         return self.levels[self.current_level_idx]
+    
+    def get_validation_steps(self, level: DifficultyLevel) -> int:
+        """Get validation steps for a level, with fallback to default"""
+        if level.val_every_steps is not None:
+            return level.val_every_steps
+        return self.default_val_every_steps
     
     def get_level_output_dir(self, level: DifficultyLevel) -> Path:
         """Get output directory for a specific level"""
@@ -241,8 +251,20 @@ class CurriculumManager:
         # Check if dataset already exists
         dataset_dirs = list(self.cache_root.glob(f"{level.name}_*"))
         if dataset_dirs:
-            logger.info(f"Using existing dataset at: {dataset_dirs[0]}")
-            return dataset_dirs[0]
+            # Check if both train and test splits exist
+            dataset_dir = dataset_dirs[0]
+            has_train = (dataset_dir / "dataset_info.json").exists() or (dataset_dir / "train").exists()
+            has_test = (dataset_dir / "test").exists() or (dataset_dir / "validation").exists()
+            
+            if has_train:
+                # Check if we need test split
+                val_split = self.base_config.get("val_split", "test")
+                if val_split in ["test", "validation"] and not has_test:
+                    logger.info(f"Train split exists but {val_split} split missing. Creating {val_split} split...")
+                    self._prepare_split(level, val_split, dataset_dir)
+                
+                logger.info(f"Using existing dataset at: {dataset_dir}")
+                return dataset_dir
         
         # Create temporary levels config for this specific level
         temp_config = {
@@ -260,20 +282,21 @@ class CurriculumManager:
             yaml.dump(temp_config, f)
         
         try:
-            # Run transform_dataset.py with real-time output
-            cmd = [
+            # First, prepare the train split
+            cmd_train = [
                 sys.executable,
                 "curriculum/transform_dataset.py",
                 "--levels_yaml", str(temp_config_path),
                 "--base_yaml", str(self.base_config_path),
                 "--cache_root", str(self.cache_root),
-                "--only_level", level.name
+                "--only_level", level.name,
+                "--split", "train"  # Explicitly set train split
             ]
             
-            logger.info(f"Running: {' '.join(cmd)}")
+            logger.info(f"Transforming train split: {' '.join(cmd_train)}")
             
             process = subprocess.Popen(
-                cmd,
+                cmd_train,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
@@ -283,43 +306,163 @@ class CurriculumManager:
             # Stream output to show progress
             for line in iter(process.stdout.readline, ''):
                 if line:
-                    print(f"  TRANSFORM: {line.rstrip()}")
+                    print(f"  TRANSFORM (train): {line.rstrip()}")
             
             return_code = process.wait()
             
             if return_code != 0:
-                raise subprocess.CalledProcessError(return_code, cmd)
+                raise subprocess.CalledProcessError(return_code, cmd_train)
             
             # Find the created dataset directory
             dataset_dirs = list(self.cache_root.glob(f"{level.name}_*"))
-            if dataset_dirs:
-                dataset_path = dataset_dirs[0]
-                logger.info(f"Dataset ready at: {dataset_path}")
-                return dataset_path
-            else:
+            if not dataset_dirs:
                 raise RuntimeError(f"Dataset directory not found for level {level.name}")
-                
+            
+            dataset_path = dataset_dirs[0]
+            
+            # Now prepare the validation/test split if needed
+            val_split = self.base_config.get("val_split", "test")
+            if val_split in ["test", "validation"]:
+                logger.info(f"Also transforming {val_split} split for validation...")
+                self._prepare_split(level, val_split, dataset_path)
+            
+            logger.info(f"Dataset ready at: {dataset_path}")
+            return dataset_path
+            
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to prepare dataset")
+            logger.error(f"Failed to prepare dataset: {e}")
             raise
         finally:
             if temp_config_path.exists():
                 temp_config_path.unlink()
+
+    def _prepare_split(self, level: DifficultyLevel, split: str, existing_dataset_path: Path):
+        """Prepare a specific split (test/validation) and merge with existing dataset"""
+        logger.info(f"Preparing {split} split for level {level.name}")
+        
+        # Create temporary levels config for this specific level
+        temp_config = {
+            "levels": [{
+                "name": level.name,
+                "difficulty_blur_sigma": level.difficulty_blur_sigma,
+                "difficulty_gray_alpha": level.difficulty_gray_alpha,
+                "difficulty_brightness": level.difficulty_brightness
+            }]
+        }
+        
+        # Create a temporary output directory for this split
+        temp_split_dir = self.cache_root / f"temp_{level.name}_{split}"
+        temp_split_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Write temporary config
+        temp_config_path = self.cache_root / f"temp_level_{level.name}_{split}.yaml"
+        with open(temp_config_path, 'w') as f:
+            yaml.dump(temp_config, f)
+        
+        try:
+            cmd_split = [
+                sys.executable,
+                "curriculum/transform_dataset.py",
+                "--levels_yaml", str(temp_config_path),
+                "--base_yaml", str(self.base_config_path),
+                "--cache_root", str(temp_split_dir),
+                "--only_level", level.name,
+                "--split", split
+            ]
+            
+            logger.info(f"Running: {' '.join(cmd_split)}")
+            
+            process = subprocess.Popen(
+                cmd_split,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1
+            )
+            
+            # Stream output to show progress
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    print(f"  TRANSFORM ({split}): {line.rstrip()}")
+            
+            return_code = process.wait()
+            
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, cmd_split)
+            
+            # Find the created split dataset
+            split_dirs = list(temp_split_dir.glob(f"{level.name}_*"))
+            if not split_dirs:
+                raise RuntimeError(f"Split dataset not found for {split}")
+            
+            split_dataset_path = split_dirs[0]
+            
+            # Now we need to merge this split into the existing dataset
+            # The dataset is saved as a HuggingFace dataset with arrow files
+            logger.info(f"Merging {split} split into main dataset...")
+            
+            # Load both datasets and combine them
+            from datasets import load_from_disk, DatasetDict
+            
+            # Load the existing dataset (might be just train or a DatasetDict)
+            existing_ds = load_from_disk(str(existing_dataset_path))
+            split_ds = load_from_disk(str(split_dataset_path))
+            
+            # Create a DatasetDict with both splits
+            if isinstance(existing_ds, DatasetDict):
+                # Already a dict, just add the new split
+                existing_ds[split] = split_ds if not isinstance(split_ds, DatasetDict) else split_ds[split]
+            else:
+                # Convert to DatasetDict
+                combined = DatasetDict({
+                    "train": existing_ds,
+                    split: split_ds if not isinstance(split_ds, DatasetDict) else split_ds[split]
+                })
+                # Save back to the original location
+                import shutil
+                temp_save = self.cache_root / f"temp_combined_{level.name}"
+                combined.save_to_disk(str(temp_save))
+                
+                # Replace the original dataset
+                shutil.rmtree(existing_dataset_path)
+                shutil.move(str(temp_save), str(existing_dataset_path))
+            
+            # If it's already a DatasetDict and we just added a split, save it
+            if isinstance(existing_ds, DatasetDict):
+                existing_ds.save_to_disk(str(existing_dataset_path))
+            
+            # Clean up temporary split directory
+            shutil.rmtree(temp_split_dir, ignore_errors=True)
+            
+            logger.info(f"Successfully added {split} split to dataset")
+            
+        except Exception as e:
+            logger.error(f"Failed to prepare {split} split: {e}")
+            # Clean up on failure
+            if temp_split_dir.exists():
+                shutil.rmtree(temp_split_dir, ignore_errors=True)
+            raise
+        finally:
+            if temp_config_path.exists():
+                temp_config_path.unlink()
+       
     
     def run_training_step(self, 
-                         level: DifficultyLevel,
-                         dataset_path: Path,
-                         resume_from: Optional[Path] = None,
-                         step_count: int = None) -> Path:
+                        level: DifficultyLevel,
+                        dataset_path: Path,
+                        resume_from: Optional[Path] = None,
+                        step_count: int = None) -> Path:
         """Execute training for one validation interval"""
         
         checkpoint_dir = self.get_level_output_dir(level)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        step_count = step_count or self.val_every_steps
+        # Use level-specific validation steps if not overridden
+        if step_count is None:
+            step_count = self.get_validation_steps(level)
         
         logger.info(f"Starting training step for level {level.name}")
-        logger.info(f"Training for {step_count} steps")
+        logger.info(f"Training for {step_count} steps (level-specific setting)")
         logger.info(f"Output: {checkpoint_dir}")
         
         # If resuming, we need to copy the checkpoint to the new directory first
@@ -348,10 +491,16 @@ class CurriculumManager:
         # Build training command
         cmd = ["accelerate", "launch", "train.py"]
         
+        # CRITICAL FIX: Check if source and target columns are the same
+        # When they are the same, transform_dataset.py creates a synthetic 'source' column
+        source_col = self.base_config.get("source_image_column", "source")
+        target_col = self.base_config.get("target_image_column", "target")
+        
         # Add base config parameters
         for key, value in self.base_config.items():
             if key in ["output_dir", "dataset_name", "gaussian_blur", "random_grayscale", 
-                      "validation_steps", "checkpointing_steps", "max_train_steps"]:
+                    "validation_steps", "checkpointing_steps", "max_train_steps",
+                    "source_image_column"]:  # Skip source_image_column, we'll handle it specially
                 continue
             
             if isinstance(value, bool):
@@ -359,6 +508,17 @@ class CurriculumManager:
                     cmd.append(f"--{key}")
             elif value is not None:
                 cmd.extend([f"--{key}", str(value)])
+        
+        # CRITICAL: If source and target were the same, transform_dataset.py created a 'source' column
+        # So we need to update the column mapping for train.py
+        if source_col == target_col:
+            # transform_dataset.py created a synthetic 'source' column with processed images
+            # and kept 'target' column with original images
+            cmd.extend(["--source_image_column", "source"])  # Use the new synthetic source column
+            logger.info(f"Note: Using synthetic 'source' column (processed) and original '{target_col}' column")
+        else:
+            # Normal case - use original source column name
+            cmd.extend(["--source_image_column", source_col])
         
         # Add level-specific overrides
         cmd.extend([
@@ -422,87 +582,7 @@ class CurriculumManager:
         except subprocess.CalledProcessError as e:
             logger.error(f"Training failed with return code: {e.returncode}")
             raise
-    
-    def generate_validation_images(self, checkpoint: Path, level: DifficultyLevel) -> Path:
-        """Generate validation images for a checkpoint"""
-        val_dir = checkpoint.parent / "val"
-        
-        # Check if validation images already exist
-        if val_dir.exists() and any(val_dir.glob("*.png")):
-            logger.info(f"Using existing validation images at {val_dir}")
-            return val_dir
-        
-        logger.info(f"Need to generate validation images for {level.name}")
-        logger.info(f"Please run validation generation manually for checkpoint: {checkpoint}")
-        logger.info(f"Expected output directory: {val_dir}")
-        
-        # For now, we'll assume validation images exist from training
-        # In practice, you'd call your validation script here
-        return val_dir
-    
-    def run_human_validation(self, 
-                            val_dir_a: Path,
-                            val_dir_b: Path,
-                            level_a: DifficultyLevel,
-                            level_b: DifficultyLevel) -> ValidationResult:
-        """Run human validation using Gradio UI"""
-        
-        logger.info(f"Launching human validation UI...")
-        logger.info(f"Comparing {level_a.name} (baseline) vs {level_b.name} (current)")
-        
-        # Find a free port
-        port = find_free_port(7860)
-        logger.info(f"Using port {port} for UI")
-        
-        # Set environment variable for port
-        env = os.environ.copy()
-        env['GRADIO_SERVER_PORT'] = str(port)
-        
-        # Launch the comparison UI
-        cmd = [
-            sys.executable,
-            "curriculum/ui_compare.py",
-            str(val_dir_a),
-            str(val_dir_b),
-            level_a.name,
-            level_b.name,
-            "--out", str(self.output_root / "validation_results.json"),
-            "--port", str(port)
-        ]
-        
-        try:
-            subprocess.run(cmd, check=True, env=env)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"UI failed: {e}")
-            raise
-        
-        # Read results
-        results_file = self.output_root / "validation_results.json"
-        if results_file.exists():
-            with open(results_file, 'r') as f:
-                results = json.load(f)
-            
-            total = results["total_comparisons"]
-            better = results["better_count"]
-            neutral = results["neutral_count"]
-            worse = results["worse_count"]
-            
-            promotion_score = (better + neutral) / total if total > 0 else 0
-            
-            return ValidationResult(
-                current_level=level_b.name,
-                baseline_level=level_a.name,
-                better_count=better,
-                neutral_count=neutral,
-                worse_count=worse,
-                total_count=total,
-                promotion_score=promotion_score,
-                should_advance=promotion_score >= self.promote_threshold,
-                validation_metadata=results
-            )
-        else:
-            logger.error("No validation results found")
-            raise RuntimeError("Validation results not saved")
+
     
     def create_intermediate_level(self, 
                                  baseline_level: DifficultyLevel,
@@ -521,6 +601,14 @@ class CurriculumManager:
         new_brightness = baseline_level.difficulty_brightness + \
                         (target_level.difficulty_brightness - baseline_level.difficulty_brightness) * factor
         
+        # For intermediate levels, inherit validation steps from target level
+        # or use a weighted average
+        if target_level.val_every_steps and baseline_level.val_every_steps:
+            new_val_steps = int(baseline_level.val_every_steps + 
+                               (target_level.val_every_steps - baseline_level.val_every_steps) * factor)
+        else:
+            new_val_steps = target_level.val_every_steps or baseline_level.val_every_steps
+        
         new_level = DifficultyLevel(
             name=f"{baseline_level.name}_to_{target_level.name}_v{retry_num+1}",
             difficulty_blur_sigma=round(new_sigma, 2),
@@ -528,49 +616,17 @@ class CurriculumManager:
             difficulty_brightness=round(new_brightness, 1),
             level_index=target_level.level_index,  # Keep target index for ordering
             is_sublevel=True,
-            parent_level=baseline_level.name
+            parent_level=baseline_level.name,
+            val_every_steps=new_val_steps
         )
         
         logger.info(f"Created intermediate level: {new_level.name}")
         logger.info(f"  Blur: {baseline_level.difficulty_blur_sigma} -> {new_level.difficulty_blur_sigma} -> {target_level.difficulty_blur_sigma}")
         logger.info(f"  Gray: {baseline_level.difficulty_gray_alpha} -> {new_level.difficulty_gray_alpha} -> {target_level.difficulty_gray_alpha}")
         logger.info(f"  Brightness: {baseline_level.difficulty_brightness} -> {new_level.difficulty_brightness} -> {target_level.difficulty_brightness}")
+        logger.info(f"  Val Steps: {self.get_validation_steps(new_level)}")
         
         return new_level
-    
-    def resume_from_validation(self):
-        """Resume from a pending validation state"""
-        if not self.validation_pending:
-            logger.info("No pending validation")
-            return None
-        
-        logger.info("Resuming from pending validation...")
-        
-        current_level = self.get_current_level()
-        
-        # Generate validation images for current checkpoint
-        val_dir_current = self.generate_validation_images(self.current_checkpoint, current_level)
-        
-        # Generate validation for baseline
-        val_dir_baseline = self.generate_validation_images(
-            self.baseline_checkpoint, 
-            self.baseline_level
-        )
-        
-        # Run validation
-        validation_result = self.run_human_validation(
-            val_dir_baseline,
-            val_dir_current,
-            self.baseline_level,
-            current_level
-        )
-        
-        # Mark validation as complete
-        self.validation_pending = False
-        self.last_action = "validation_completed"
-        self._save_state()
-        
-        return validation_result
     
     def run_curriculum(self, start_level: int = None, resume: bool = True):
         """Main curriculum training loop with resume capability"""
@@ -592,7 +648,7 @@ class CurriculumManager:
         else:
             logger.info("="*80)
             logger.info("Starting NEW Curriculum Training")
-            logger.info(f"Levels: {[l.name for l in self.levels]}")
+            logger.info(f"Levels: {[(l.name, f'{self.get_validation_steps(l)} steps') for l in self.levels]}")
             logger.info(f"Promotion threshold: {self.promote_threshold}")
             logger.info("="*80)
             
@@ -601,9 +657,11 @@ class CurriculumManager:
         
         while self.current_level_idx < len(self.levels):
             current_level = self.get_current_level()
+            val_steps = self.get_validation_steps(current_level)
             
             logger.info(f"\n{'='*60}")
             logger.info(f"LEVEL {current_level.level_index}: {current_level.name}")
+            logger.info(f"Validation interval: {val_steps} steps")
             if current_level.is_sublevel:
                 logger.info(f"  (Intermediate level - retry {self.retry_count})")
             logger.info(f"{'='*60}")
@@ -614,7 +672,7 @@ class CurriculumManager:
             # Determine checkpoint to resume from
             resume_checkpoint = self.baseline_checkpoint if self.baseline_checkpoint else None
             
-            # Train for one validation interval
+            # Train for one validation interval (using level-specific steps)
             self.last_action = "training"
             self._save_state()
             
@@ -622,11 +680,12 @@ class CurriculumManager:
                 current_level,
                 dataset_path,
                 resume_from=resume_checkpoint,
-                step_count=self.val_every_steps
+                step_count=val_steps  # Use level-specific validation steps
             )
             
-            self.training_steps_total += self.val_every_steps
+            self.training_steps_total += val_steps
             
+            # Rest of the method remains the same...
             # Mark that validation is pending
             self.validation_pending = True
             self.last_action = "training_completed"
@@ -694,6 +753,119 @@ class CurriculumManager:
         self._save_state()
         
         return self.baseline_checkpoint
+    
+    def generate_validation_images(self, checkpoint: Path, level: DifficultyLevel) -> Path:
+        """Generate validation images for a checkpoint"""
+        val_dir = checkpoint.parent / "val"
+        
+        # Check if validation images already exist
+        if val_dir.exists() and any(val_dir.glob("*.png")):
+            logger.info(f"Using existing validation images at {val_dir}")
+            return val_dir
+        
+        logger.info(f"Need to generate validation images for {level.name}")
+        logger.info(f"Please run validation generation manually for checkpoint: {checkpoint}")
+        logger.info(f"Expected output directory: {val_dir}")
+        
+        return val_dir
+    
+    def run_human_validation(self, 
+                            val_dir_a: Path,
+                            val_dir_b: Path,
+                            level_a: DifficultyLevel,
+                            level_b: DifficultyLevel) -> ValidationResult:
+        """Run human validation using Gradio UI"""
+        
+        logger.info(f"Launching human validation UI...")
+        logger.info(f"Comparing {level_a.name} (baseline) vs {level_b.name} (current)")
+        
+        # Find a free port
+        port = find_free_port(7860)
+        logger.info(f"Using port {port} for UI")
+        
+        # Set environment variable for port
+        env = os.environ.copy()
+        env['GRADIO_SERVER_PORT'] = str(port)
+        
+        # Launch the comparison UI
+        cmd = [
+            sys.executable,
+            "curriculum/ui_compare.py",
+            str(val_dir_a),
+            str(val_dir_b),
+            level_a.name,
+            level_b.name,
+            "--out", str(self.output_root / "validation_results.json"),
+            "--port", str(port)
+        ]
+        
+        try:
+            subprocess.run(cmd, check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"UI failed: {e}")
+            raise
+        
+        # Read results
+        results_file = self.output_root / "validation_results.json"
+        if results_file.exists():
+            with open(results_file, 'r') as f:
+                results = json.load(f)
+            
+            total = results["total_comparisons"]
+            better = results["better_count"]
+            neutral = results["neutral_count"]
+            worse = results["worse_count"]
+            
+            promotion_score = (better + neutral) / total if total > 0 else 0
+            
+            return ValidationResult(
+                current_level=level_b.name,
+                baseline_level=level_a.name,
+                better_count=better,
+                neutral_count=neutral,
+                worse_count=worse,
+                total_count=total,
+                promotion_score=promotion_score,
+                should_advance=promotion_score >= self.promote_threshold,
+                validation_metadata=results
+            )
+        else:
+            logger.error("No validation results found")
+            raise RuntimeError("Validation results not saved")
+    
+    def resume_from_validation(self):
+        """Resume from a pending validation state"""
+        if not self.validation_pending:
+            logger.info("No pending validation")
+            return None
+        
+        logger.info("Resuming from pending validation...")
+        
+        current_level = self.get_current_level()
+        
+        # Generate validation images for current checkpoint
+        val_dir_current = self.generate_validation_images(self.current_checkpoint, current_level)
+        
+        # Generate validation for baseline
+        val_dir_baseline = self.generate_validation_images(
+            self.baseline_checkpoint, 
+            self.baseline_level
+        )
+        
+        # Run validation
+        validation_result = self.run_human_validation(
+            val_dir_baseline,
+            val_dir_current,
+            self.baseline_level,
+            current_level
+        )
+        
+        # Mark validation as complete
+        self.validation_pending = False
+        self.last_action = "validation_completed"
+        self._save_state()
+        
+        return validation_result
     
     def _process_validation_result(self, validation_result: ValidationResult):
         """Process validation result and update state accordingly"""

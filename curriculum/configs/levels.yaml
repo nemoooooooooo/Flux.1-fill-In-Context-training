@@ -1,26 +1,39 @@
 levels:
  - name: lvl1
+   difficulty_blur_sigma: 7
+   difficulty_gray_alpha: 0.2
+   difficulty_brightness: 40
+   val_every_steps: 5
+
+ - name: lvl2
    difficulty_blur_sigma: 15
    difficulty_gray_alpha: 0.65
    difficulty_brightness: 55
 
- - name: lvl2
+
+ - name: lvl3
    difficulty_blur_sigma: 20
    difficulty_gray_alpha: 0.80
    difficulty_brightness: 70
+   val_every_steps: 3
 
- - name: lvl3
+
+ - name: lvl4
    difficulty_blur_sigma: 25
    difficulty_gray_alpha: 1
    difficulty_brightness: 85
+   val_every_steps: 5
 
- - name: lvl4
+
+ - name: lvl5
    difficulty_blur_sigma: 30
    difficulty_gray_alpha: 1.00
    difficulty_brightness: 200
+   val_every_steps: 5
 
-promote_threshold : 0.55   # ≥55 % "better or equal" votes → promote
-repeat_backoff    : 0.75   # on plain repeat (not failure) multiply σ & α by 0.75
-fail_halve_factor : 0.50   # on failed graduation create sub-level with σ,α × 0.50
-val_every_steps   : 3    # run hard validation every 500 optimiser steps
-max_validation_samples: 3
+promote_threshold : 0.55       # ≥55 % "better or equal" votes → promote
+repeat_backoff    : 0.75       # on plain repeat (not failure) multiply σ & α by 0.75
+fail_halve_factor : 0.50       # on failed graduation create sub-level with σ,α × 0.50
+val_every_steps: 3             # default validation steps if not specified per level
+max_validation_samples: 3      # limit validation samples for speed
+max_retries: 3                 # max retry attempts before skipping level

@@ -81,9 +81,13 @@ def masked_bg_gray_blur_batch_uint8(
 # -------------- HF -> Torch loader -------------
 
 class HFDSourceMaskDataset(Dataset):
-    def __init__(self, ds: datasets.Dataset, source_col: str, mask_col: str):
+    def __init__(self, ds: datasets.Dataset, process_col: str, mask_col: str):
+        """
+        process_col: The column to process (might be same as target)
+        mask_col: The mask column
+        """
         self.ds = ds
-        self.source_col = source_col
+        self.process_col = process_col
         self.mask_col = mask_col
 
     def __len__(self):
@@ -91,8 +95,8 @@ class HFDSourceMaskDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.ds[idx]
-        pil_src = row[self.source_col]   # PIL RGB
-        pil_msk = row[self.mask_col]     # PIL L or RGB
+        pil_src = row[self.process_col]   # PIL RGB - the image to process
+        pil_msk = row[self.mask_col]      # PIL L or RGB
 
         t_src = pil_to_tensor(pil_src)   # uint8 [C,H,W]
         if t_src.ndim == 2:  # grayscale → 3ch
@@ -142,6 +146,7 @@ def build_level_dataset_fast_masked(
     orig_cfg: str | None,
     level: dict,
     source_col: str,
+    target_col: str,
     mask_col: str,
     cache_root: Path,
     split: str = "train",
@@ -154,16 +159,19 @@ def build_level_dataset_fast_masked(
 ) -> Path:
     """
     Build a processed dataset for one level where:
-      - ONLY the 'source_col' images are transformed & replaced with processed file paths
-      - The 'target' column (whatever it is named in the original dataset) remains UNTOUCHED
+      - If source_col == target_col: Create a synthetic 'source' column with processed target
+      - Otherwise: Process the source_col and leave target_col untouched
     """
     cache_root = Path(cache_root); cache_root.mkdir(parents=True, exist_ok=True)
-    # Keep UID stable (do NOT include brightness to preserve old path shapes)
+    
+    # Keep UID stable
     key = {
         "name": level["name"],
         "sigma": float(level["difficulty_blur_sigma"]),
         "alpha": float(level["difficulty_gray_alpha"]),
+        "brightness": float(level.get("difficulty_brightness", 50.0)),
         "source_col": source_col,
+        "target_col": target_col,
         "mask_col": mask_col,
         "dataset": orig_name,
         "dataset_cfg": orig_cfg or "",
@@ -177,13 +185,21 @@ def build_level_dataset_fast_masked(
         return out_dir
 
     ds = datasets.load_dataset(orig_name, orig_cfg, split=split)
-    if not isinstance(ds.features[source_col], HFImage): ds = ds.cast_column(source_col, HFImage())
-    if not isinstance(ds.features[mask_col],  HFImage): ds = ds.cast_column(mask_col,  HFImage())
+    
+    # Special case: when source and target are the same column
+    same_column = (source_col == target_col)
+    process_col = target_col if same_column else source_col
+    
+    # Cast columns to Image type
+    if not isinstance(ds.features[process_col], HFImage): 
+        ds = ds.cast_column(process_col, HFImage())
+    if not isinstance(ds.features[mask_col], HFImage): 
+        ds = ds.cast_column(mask_col, HFImage())
 
     imgs_dir = out_dir / "images"; imgs_dir.mkdir(parents=True, exist_ok=True)
 
     torch.set_num_threads(max(1, os.cpu_count() // 2))
-    dset = HFDSourceMaskDataset(ds, source_col, mask_col)
+    dset = HFDSourceMaskDataset(ds, process_col, mask_col)
     loader = DataLoader(
         dset,
         batch_size=batch_size,
@@ -212,7 +228,7 @@ def build_level_dataset_fast_masked(
             return executor.submit(write_jpeg, img_u8_chw, str(fn), quality=jpeg_quality)
 
     futures = []
-    with tqdm(total=len(dset), desc=f"{level['name']} (σ={sigma}, α={alpha})") as pbar:
+    with tqdm(total=len(dset), desc=f"{level['name']} (σ={sigma}, α={alpha}, β={brightness})") as pbar:
         for idxs, batch_u8, masks_u8, sizes in loader:
             batch_u8 = batch_u8.to(device, non_blocking=True)   # [B,3,H,W]
             masks_u8 = masks_u8.to(device, non_blocking=True)   # [B,1,H,W]
@@ -229,18 +245,34 @@ def build_level_dataset_fast_masked(
     for f in tqdm(futures, desc="Flush writes"): f.result()
     executor.shutdown(wait=True)
 
-    # Bind processed file paths back into a HF dataset — **ONLY** source_col
+    # Bind processed file paths back into a HF dataset
     files = [str(imgs_dir / f"{i}.{save_format}") for i in range(len(ds))]
 
-    def path_mapper(example, idx):
-        # replace ONLY source_col with processed path
-        example[source_col] = files[idx]
-        # DO NOT touch target column (GT remains original)
-        return example
-
-    ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Bind processed source paths")
-    ds2 = ds2.cast_column(source_col, HFImage())  # processed source
-    # NOTE: target column is left as-is; no cast/overwrite here
+    if same_column:
+        # Special case: source and target are the same column
+        # We need to create a new 'source' column with processed images
+        # and keep 'target' column with original images
+        print(f"INFO: source_col == target_col ('{source_col}'). Creating synthetic 'source' column.")
+        
+        def path_mapper(example, idx):
+            # Create a new 'source' column with processed image
+            example['source'] = files[idx]
+            # Keep the original target column unchanged
+            return example
+        
+        ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Create synthetic source column")
+        ds2 = ds2.cast_column('source', HFImage())  # processed source
+        # target column remains as original
+    else:
+        # Normal case: source and target are different columns
+        def path_mapper(example, idx):
+            # Replace ONLY source_col with processed path
+            example[source_col] = files[idx]
+            # DO NOT touch target column (GT remains original)
+            return example
+        
+        ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Bind processed source paths")
+        ds2 = ds2.cast_column(source_col, HFImage())  # processed source
 
     tmp = Path(tempfile.mkdtemp(prefix="lvl_fast_"))
     try:
@@ -259,7 +291,7 @@ def save_topk_previews(out_dir: Path,
                        ds_name: str,
                        ds_cfg: str | None,
                        split: str,
-                       source_col: str,
+                       process_col: str,
                        fmt: str,
                        topk: int):
     """
@@ -268,17 +300,16 @@ def save_topk_previews(out_dir: Path,
     """
     if topk <= 0: return
     ds = datasets.load_dataset(ds_name, ds_cfg, split=split)
-    if not isinstance(ds.features[source_col], HFImage):
-        ds = ds.cast_column(source_col, HFImage())
+    if not isinstance(ds.features[process_col], HFImage):
+        ds = ds.cast_column(process_col, HFImage())
 
     prev_dir = out_dir / "preview"
     prev_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(min(topk, len(ds))):
-        orig_pil = ds[i][source_col]  # original source (before replacement)
+        orig_pil = ds[i][process_col]  # original image (before replacement)
         tr_path = out_dir / "images" / f"{i}.{fmt}"
         if not tr_path.exists():
-            # if the full dataset wasn't built, skip missing ones gracefully
             continue
         tr_pil = Image.open(tr_path).convert("RGB")
         # side-by-side
@@ -318,6 +349,7 @@ def main():
     ds_name = base_cfg["dataset_name"]
     ds_cfg  = base_cfg.get("dataset_config_name", None)
     source_col = base_cfg["source_image_column"]
+    target_col = base_cfg.get("target_image_column", "target")  # default to 'target' if not specified
     mask_col   = base_cfg["mask_column"]
 
     levels = levels_cfg.get("levels", [])
@@ -334,6 +366,7 @@ def main():
             orig_cfg=ds_cfg,
             level=lvl,
             source_col=source_col,
+            target_col=target_col,
             mask_col=mask_col,
             cache_root=cache_root,
             split=args.split,
@@ -343,9 +376,11 @@ def main():
             writer_threads=args.writer_threads,
         )
         built.append({"name": lvl["name"], "path": str(out_dir)})
-        # Optional visual sanity check
+        
+        # For preview, use the column that was actually processed
+        process_col = target_col if source_col == target_col else source_col
         try:
-            save_topk_previews(out_dir, lvl["name"], ds_name, ds_cfg, args.split, source_col, args.fmt, args.preview_topk)
+            save_topk_previews(out_dir, lvl["name"], ds_name, ds_cfg, args.split, process_col, args.fmt, args.preview_topk)
         except Exception:
             pass  # previews are best-effort
 
