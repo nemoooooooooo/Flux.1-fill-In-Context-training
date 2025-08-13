@@ -81,14 +81,41 @@ class PairedImageDataset(Dataset):
         self.is_train = split == "train"  # toggle augments
 
         # ----------------------------- HF load --------------------------------
-        from datasets import load_dataset
+        from datasets import load_dataset, load_from_disk, Dataset, DatasetDict
 
-        self.ds = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split=split,
-        )
+        ds_obj = None
+        name = getattr(args, "dataset_name", None)
+
+        if name is None:
+            raise ValueError("args.dataset_name must be provided")
+
+        # If dataset_name points to an existing folder, treat it as a local HF dataset
+        # built with datasets.save_to_disk(...)
+        if Path(name).exists() and Path(name).is_dir():
+            ds_obj = load_from_disk(name)
+            if isinstance(ds_obj, DatasetDict):
+                if split not in ds_obj:
+                    raise ValueError(
+                        f"Local dataset at {name} has splits {list(ds_obj.keys())}, "
+                        f"but you requested split='{split}'."
+                    )
+                self.ds = ds_obj[split]
+            else:
+                # A single-split Dataset saved to disk (no split names).
+                # We ignore the requested `split` and use it directly.
+                self.ds = ds_obj
+                if split not in ("train", "validation", "test"):
+                    # just to avoid confusion in logs
+                    logging.info(f"[PairedImageDataset] Local dataset has no splits; using it as-is (requested split='{split}')")
+        else:
+            # Remote or scripted dataset on the Hub
+            self.ds = load_dataset(
+                name,
+                getattr(args, "dataset_config_name", None),
+                cache_dir=getattr(args, "cache_dir", None),
+                split=split,
+            )
+
 
         cols = self.ds.column_names
         have_src = args.source_image_column in cols
@@ -319,7 +346,7 @@ if __name__ == "__main__":
         p.add_argument("--caption_column",        default="ai_name")
         p.add_argument("--mask_column",           default="mask")
         # ––– mode override (optional)
-        p.add_argument("--panel_mode",            choices=["paired", "single"], default=None)
+        p.add_argument("--panel_mode",            choices=["paired", "single"], default="paired")
         # ––– augs / buckets
         p.add_argument("--aspect_ratio_buckets",  default="1184,880")
         p.add_argument("--random_flip",           action="store_true", default=True)

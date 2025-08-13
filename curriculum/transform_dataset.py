@@ -8,6 +8,7 @@ from pathlib import Path
 import hashlib
 import shutil
 import tempfile
+import json
 
 import numpy as np
 import yaml
@@ -23,6 +24,7 @@ import datasets
 from datasets import Image as HFImage
 from PIL import Image
 
+
 # ---------------- GPU kernels ----------------
 
 def gaussian_kernels_1d(sigma: float, device: torch.device, dtype=torch.float32):
@@ -36,17 +38,18 @@ def gaussian_kernels_1d(sigma: float, device: torch.device, dtype=torch.float32)
     ky = k.view(1, 1, size, 1).expand(3, 1, size, 1).contiguous()
     return kx, ky, radius
 
+
 @torch.no_grad()
 def masked_bg_gray_blur_batch_uint8(
     src_u8: torch.Tensor,    # [B,3,H,W] uint8 on device
     m_u8: torch.Tensor,      # [B,1,H,W] uint8 on device (0..255)
     kx, ky, radius: int,
     alpha: float,
-    brightness: float,       # NEW: brightness in the same scale as your YAML (0..200 per example)
+    brightness: float,       # 0..200 like your YAML
 ) -> torch.Tensor:
     """
     out = where(mask<128, src, brightness_adjust( mix(gray(blur(src)), blur(src), alpha) ))
-    Brightness adjust emulates: cv2.convertScaleAbs(result, alpha=1.0, beta=(brightness-50)*2.55)
+    Brightness adjust ~= OpenCV beta shift with beta=(brightness-50)*2.55
     """
     # Normalize to [0,1]
     x = src_u8.to(torch.float32) / 255.0
@@ -63,9 +66,9 @@ def masked_bg_gray_blur_batch_uint8(
     gray3 = (0.299 * r + 0.587 * g + 0.114 * b).repeat(1, 3, 1, 1)
     mixed = gray3 * float(alpha) + blurred * (1.0 - float(alpha))
 
-    # --- Brightness adjust like OpenCV convertScaleAbs with beta=(brightness-50)*2.55 ---
-    beta_u8 = (float(brightness) - 50.0) * 2.55   # shift in [uint8] space
-    beta = beta_u8 / 255.0                        # convert to [0..1] space
+    # --- Brightness shift ---
+    beta_u8 = (float(brightness) - 50.0) * 2.55   # uint8 space
+    beta = beta_u8 / 255.0                        # [0..1] space
     processed = (mixed + beta).clamp(0.0, 1.0)
 
     # --- Compose with original using mask ---
@@ -73,6 +76,7 @@ def masked_bg_gray_blur_batch_uint8(
     out = m3 * x + (1.0 - m3) * processed
     out = (out.clamp(0, 1) * 255.0).round().to(torch.uint8)
     return out
+
 
 # -------------- HF -> Torch loader -------------
 
@@ -106,6 +110,7 @@ class HFDSourceMaskDataset(Dataset):
 
         return idx, t_src, t_msk.unsqueeze(0)  # [1,H,W] mask
 
+
 def pad_collate(batch):
     idxs, imgs, masks = zip(*batch)
     max_h = max(x.shape[1] for x in imgs)
@@ -129,6 +134,7 @@ def pad_collate(batch):
         torch.tensor(sizes, dtype=torch.int32),
     )
 
+
 # -------------- Builder -----------------------
 
 def build_level_dataset_fast_masked(
@@ -146,8 +152,13 @@ def build_level_dataset_fast_masked(
     device: str = "cuda",
     writer_threads: int = 8,
 ) -> Path:
+    """
+    Build a processed dataset for one level where:
+      - ONLY the 'source_col' images are transformed & replaced with processed file paths
+      - The 'target' column (whatever it is named in the original dataset) remains UNTOUCHED
+    """
     cache_root = Path(cache_root); cache_root.mkdir(parents=True, exist_ok=True)
-    # NOTE: keep UID the same shape as before (no brightness in key) so paths/preview behavior stay identical
+    # Keep UID stable (do NOT include brightness to preserve old path shapes)
     key = {
         "name": level["name"],
         "sigma": float(level["difficulty_blur_sigma"]),
@@ -189,7 +200,7 @@ def build_level_dataset_fast_masked(
 
     sigma = float(level["difficulty_blur_sigma"])
     alpha = float(level["difficulty_gray_alpha"])
-    brightness = float(level.get("difficulty_brightness", 50.0))  # default 50 like your OpenCV example
+    brightness = float(level.get("difficulty_brightness", 50.0))
     kx, ky, radius = gaussian_kernels_1d(sigma, device)
 
     executor = ThreadPoolExecutor(max_workers=writer_threads)
@@ -218,13 +229,18 @@ def build_level_dataset_fast_masked(
     for f in tqdm(futures, desc="Flush writes"): f.result()
     executor.shutdown(wait=True)
 
-    # Bind file paths back into a HF dataset
+    # Bind processed file paths back into a HF dataset — **ONLY** source_col
     files = [str(imgs_dir / f"{i}.{save_format}") for i in range(len(ds))]
+
     def path_mapper(example, idx):
+        # replace ONLY source_col with processed path
         example[source_col] = files[idx]
+        # DO NOT touch target column (GT remains original)
         return example
-    ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Bind file paths")
-    ds2 = ds2.cast_column(source_col, HFImage())
+
+    ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Bind processed source paths")
+    ds2 = ds2.cast_column(source_col, HFImage())  # processed source
+    # NOTE: target column is left as-is; no cast/overwrite here
 
     tmp = Path(tempfile.mkdtemp(prefix="lvl_fast_"))
     try:
@@ -234,6 +250,7 @@ def build_level_dataset_fast_masked(
         shutil.rmtree(tmp, ignore_errors=True)
 
     return out_dir
+
 
 # --------- PREVIEW (side-by-side originals vs transformed) -------------------
 
@@ -258,7 +275,7 @@ def save_topk_previews(out_dir: Path,
     prev_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(min(topk, len(ds))):
-        orig_pil = ds[i][source_col]  # PIL
+        orig_pil = ds[i][source_col]  # original source (before replacement)
         tr_path = out_dir / "images" / f"{i}.{fmt}"
         if not tr_path.exists():
             # if the full dataset wasn't built, skip missing ones gracefully
@@ -272,71 +289,72 @@ def save_topk_previews(out_dir: Path,
         board.paste(tr_pil, (orig_pil.width, 0))
         board.save(prev_dir / f"idx{i}_{level_name}.png")
 
-# -------------- CLI --------------------------
+
+# -------------------------- CLI / Main ---------------------------------------
+
+def _load_yaml(path: str):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--levels_yaml", default="configs/levels.yaml")
-    ap.add_argument("--base_yaml",   default="configs/base.yaml")
-    ap.add_argument("--cache_root",  default="levels_cache")
-    ap.add_argument("--split",       default="train")
-    ap.add_argument("--only_level",  type=str, default=None)
-    ap.add_argument("--loader_workers", type=int, default=32)
-    ap.add_argument("--batch_size",     type=int, default=64)
-    ap.add_argument("--format",         type=str, default="jpg", choices=["jpg","png"])
-    ap.add_argument("--jpeg_quality",   type=int, default=92)
-    ap.add_argument("--device",         type=str, default="cuda")
-    ap.add_argument("--writer_threads", type=int, default=8)
-    # NEW: optional previews
-    ap.add_argument("--preview_topk",   type=int, default=0, help="If >0, save side-by-side previews for top-K indices per level")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser("Build processed source-only datasets for curriculum levels")
+    parser.add_argument("--levels_yaml", type=str, required=True, help="Path to levels.yaml")
+    parser.add_argument("--base_yaml", type=str, required=True, help="Path to base.yaml")
+    parser.add_argument("--cache_root", type=str, required=True, help="Where to write level caches")
+    parser.add_argument("--only_level", type=str, default=None, help="Build only this level name")
+    parser.add_argument("--split", type=str, default="train", help="Split to process (default: train)")
+    parser.add_argument("--fmt", type=str, default="jpg", choices=["jpg", "png"], help="Save format")
+    parser.add_argument("--quality", type=int, default=92, help="JPEG quality (if fmt=jpg)")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for processing kernels")
+    parser.add_argument("--writer_threads", type=int, default=8, help="Parallel file writers")
+    parser.add_argument("--preview_topk", type=int, default=8, help="Optional preview grid count")
+    args = parser.parse_args()
 
-    levels = yaml.safe_load(open(args.levels_yaml))["levels"]
-    base   = yaml.safe_load(open(args.base_yaml))
+    levels_cfg = _load_yaml(args.levels_yaml)
+    base_cfg = _load_yaml(args.base_yaml)
+
+    # Required fields from base config
+    ds_name = base_cfg["dataset_name"]
+    ds_cfg  = base_cfg.get("dataset_config_name", None)
+    source_col = base_cfg["source_image_column"]
+    mask_col   = base_cfg["mask_column"]
+
+    levels = levels_cfg.get("levels", [])
     if args.only_level:
-        levels = [lv for lv in levels if lv["name"] == args.only_level]
-        if not levels:
-            raise SystemExit(f"No level named '{args.only_level}' in {args.levels_yaml}")
+        levels = [lvl for lvl in levels if lvl["name"] == args.only_level]
 
-    source_col = base["source_image_column"]
-    mask_col   = base.get("mask_column")
-    if not mask_col:
-        raise SystemExit("base.yaml must define mask_column for masked transformation.")
+    cache_root = Path(args.cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True)
 
-    orig_name  = base["dataset_name"]
-    orig_cfg   = base.get("dataset_config_name", None)
-
-    Path(args.cache_root).mkdir(parents=True, exist_ok=True)
-
+    built = []
     for lvl in levels:
-        out = build_level_dataset_fast_masked(
-            orig_name=orig_name,
-            orig_cfg=orig_cfg,
+        out_dir = build_level_dataset_fast_masked(
+            orig_name=ds_name,
+            orig_cfg=ds_cfg,
             level=lvl,
             source_col=source_col,
             mask_col=mask_col,
-            cache_root=Path(args.cache_root),
+            cache_root=cache_root,
             split=args.split,
-            loader_workers=args.loader_workers,
-            batch_size=args.batch_size,
-            save_format=args.format,
-            jpeg_quality=args.jpeg_quality,
+            save_format=args.fmt,
+            jpeg_quality=args.quality,
             device=args.device,
             writer_threads=args.writer_threads,
         )
-        print(f"✅ {lvl['name']} → {out}")
-        if args.preview_topk > 0:
-            save_topk_previews(
-                out_dir=out,
-                level_name=lvl["name"],
-                ds_name=orig_name,
-                ds_cfg=orig_cfg,
-                split=args.split,
-                source_col=source_col,
-                fmt=args.format,
-                topk=args.preview_topk,
-            )
-            print(f"   ↳ previews: {out / 'preview'}")
+        built.append({"name": lvl["name"], "path": str(out_dir)})
+        # Optional visual sanity check
+        try:
+            save_topk_previews(out_dir, lvl["name"], ds_name, ds_cfg, args.split, source_col, args.fmt, args.preview_topk)
+        except Exception:
+            pass  # previews are best-effort
+
+    # Emit a small summary file (handy for debugging)
+    summary = cache_root / "last_build_summary.json"
+    with open(summary, "w") as f:
+        json.dump(built, f, indent=2)
+    print(json.dumps(built, indent=2))
+
 
 if __name__ == "__main__":
     main()

@@ -27,4 +27,5 @@ levels:
 promote_threshold : 0.55   # ≥55 % "better or equal" votes → promote
 repeat_backoff    : 0.75   # on plain repeat (not failure) multiply σ & α by 0.75
 fail_halve_factor : 0.50   # on failed graduation create sub-level with σ,α × 0.50
-val_every_steps   : 500    # run hard validation every 500 optimiser steps
+val_every_steps   : 950    # run hard validation every 500 optimiser steps
+max_validation_samples: 50

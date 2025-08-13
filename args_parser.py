@@ -441,6 +441,12 @@ def parse_args(input_args=None):
         default="attn",
         help="Comma-separated substrings; after prefix match, name must contain ANY of these."
     )
+    parser.add_argument(
+        "--max_validation_samples",
+        type=int,
+        default=None,
+        help="Maximum number of validation samples to use (default: use all)"
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)

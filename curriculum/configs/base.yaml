@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────
+# base.yaml – common config for every run
+# ─────────────────────────────────────────────
+
+### I/O & tracking
+output_dir: blur_saks_transformer_weights_c1        # overridden by CurriculumManager per level
+logging_dir: logs
+report_to: wandb
+tracker_project_name: SAKS_conditional_generation_c1
+push_to_hub: false
+hub_token: null
+
+### Model & precision
+pretrained_model_name_or_path: black-forest-labs/FLUX.1-Fill-dev
+base_transformer: null
+revision: null
+variant: null
+mixed_precision: bf16
+allow_tf32: false
+
+### Dataset
+dataset_name: "SnapwearAI/SAKS_INCONTEXT_Transformations"
+dataset_config_name: null
+cache_dir: null                            
+source_image_column: target
+target_image_column: target
+mask_column: mask
+caption_column: gender
+caption_template: >-
+  Two-panel image showcase image transformation from a reference image with jewelery in focus to realistic 4K photograph;
+  [IMAGE1] reference image.
+  [IMAGE2] Lifelike studio DSLR photograph of the {cap} model, natural skin texture, fashion photography aesthetic
+panel_mode: paired
+invert_mask: false
+
+### Augmentation / curriculum knobs
+aspect_ratio_buckets: "1024,768"
+random_flip: true
+random_crop: false
+center_crop: true
+color_jitter: "0,0,0,0"
+#  ↓↓↓  these two are overwritten per level  ↓↓↓
+gaussian_blur: 0.0                         # σ max (0 = off)  ← overridden by levels/*.yaml
+random_grayscale: 0.0                      # probability      ← overridden by levels/*.yaml
+kernel_size: null                          # optional: override if you need an explicit blur kernel
+
+### Training hyper-params
+train_mode: base                           # (or "base")
+lora_layers: null                          # leave null → full default set in train.py
+gradient_checkpointing: true
+batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1e-5
+lr_scheduler: constant
+lr_warmup_steps: 500
+lr_num_cycles: 1
+lr_power: 1.0
+scale_lr: false
+optimizer: AdamW
+use_8bit_adam: false
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.0001
+adam_epsilon: 1.0e-8
+rank: 128
+max_grad_norm: 1.0
+
+### Training length & checkpoints
+num_train_epochs: 30
+max_train_steps: 30000
+validation_steps: 400
+val_split: test
+checkpointing_steps: 500
+checkpoints_total_limit: 10
+resume_from_checkpoint: null               # "latest" or a path if resuming
+
+### Prompt / guidance
+instance_prompt: null                      # not used because we supply captions
+max_sequence_length: 512
+guidance_scale: 3.5
+
+### SD-3 weighting scheme (unchanged)
+weighting_scheme: none
+logit_mean: 0.0
+logit_std: 1.0
+mode_scale: 1.29
+
+### Prefix / include filters (only used when train_mode==base)
+trainable_name_prefixes: "transformer_blocks.,single_transformer_blocks."
+train_includes: "attn"

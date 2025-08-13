@@ -54,7 +54,7 @@ logger = get_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Validation helper
 # ─────────────────────────────────────────────────────────────────────────────
-def log_validation(pipeline, args, accelerator, dataloader, tag="validation"):
+def log_validation(pipeline, args, accelerator, dataloader, tag="validation", save_dir=None):
     """
     Run one pass over `dataloader`, create images, and push them to any active
     accelerator trackers (e.g. WandB).  Image *height* and *width* are taken
@@ -71,6 +71,11 @@ def log_validation(pipeline, args, accelerator, dataloader, tag="validation"):
     else:
         autocast_ctx = nullcontext()
 
+    # optional disk output
+    save_dir = Path(save_dir) if save_dir is not None else None
+    if save_dir is not None and accelerator.is_main_process:
+        save_dir.mkdir(parents=True, exist_ok=True)
+
     # keep generator deterministic if a seed is provided
     gen = (
         torch.Generator(device=accelerator.device).manual_seed(args.seed)
@@ -79,8 +84,14 @@ def log_validation(pipeline, args, accelerator, dataloader, tag="validation"):
     )
 
     logged = []
+    samples_processed = 0
     with autocast_ctx:
         for batch in dataloader:
+            # Check if we've reached the max samples limit
+            if args.max_validation_samples and samples_processed >= args.max_validation_samples:
+                logger.info(f"Reached max validation samples limit: {args.max_validation_samples}")
+                break
+
             prompt = batch["prompts"]                      # list[str] (len == batch)
             image  = batch["pixel_values"]                 # (B, C, H, W) tensor
             mask   = batch["mask_pixel_values"]            # (B, 1, H, W) tensor
@@ -104,6 +115,20 @@ def log_validation(pipeline, args, accelerator, dataloader, tag="validation"):
             ).images
 
             logged.append((pil_img[0], pil_msk[0], outs[0], prompt[0]))
+
+            # save ALL images of the batch to disk (main process only)
+            if save_dir is not None and accelerator.is_main_process:
+                for i, out_img in enumerate(outs):
+                    idx = samples_processed + i
+                    base = save_dir / f"{idx:05d}"
+                    try:
+                        pil_img[i].save(base.with_name(f"val_{base.stem}_source.png"))
+                        pil_msk[i].save(base.with_name(f"val_{base.stem}_mask.png"))
+                        out_img.save(base.with_name(f"val_{base.stem}_result.png"))
+                    except Exception as e:
+                        logger.warning(f"Failed to save sample {idx}: {e}")
+
+            samples_processed += len(prompt) 
 
     # ──> log to tracker
     for tracker in accelerator.trackers:
@@ -646,6 +671,8 @@ def main(args):
         write_mode_marker(args.output_dir, args.train_mode)
 
         if dl_val is not None:
+            save_dir = Path(args.output_dir) / "val"
+
             if args.train_mode == "lora":
                 pipe = FluxFillPipeline.from_pretrained(
                     args.pretrained_model_name_or_path, torch_dtype=weight_dtype
@@ -661,7 +688,7 @@ def main(args):
                     transformer=tuned_tx,
                     torch_dtype=weight_dtype,
                 )
-            log_validation(pipe, args, accelerator, dl_val, tag="test")
+            log_validation(pipe, args, accelerator, dl_val, tag="test", save_dir=save_dir)
             del pipe; free_memory()
 
         if args.push_to_hub:
