@@ -78,17 +78,139 @@ def masked_bg_gray_blur_batch_uint8(
     return out
 
 
+@torch.no_grad()
+def create_progressive_mask_batch(
+    original_masks: torch.Tensor,  # [B,1,H,W] uint8 masks (jewelry=black)
+    white_coverage_percent: float,
+    patch_size_range: tuple = (20, 80),
+    device: torch.device = None,
+    seed: int = None,
+    max_iterations: int = 2000,  # Maximum attempts to reach target coverage
+) -> torch.Tensor:
+    """
+    Improved progressive mask creation that accurately achieves target white coverage.
+    """
+    if device is None:
+        device = original_masks.device
+    
+    B, _, H, W = original_masks.shape
+    
+    # Set seed for reproducibility if provided
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+    
+    # Process on GPU if possible
+    masks_float = original_masks.float() / 255.0  # [B,1,H,W] in [0,1]
+    jewelry_mask = (masks_float < 0.5).float()  # 1 where jewelry, 0 elsewhere
+    
+    if white_coverage_percent >= 99:
+        # For very high coverage, all white except jewelry
+        progressive_masks = torch.ones_like(masks_float)
+        progressive_masks = progressive_masks * (1 - jewelry_mask)  # Set jewelry to black
+        return (progressive_masks * 255).byte()
+    
+    # Create base masks (all black)
+    progressive_masks = torch.zeros((B, 1, H, W), device=device, dtype=torch.float32)
+    
+    # Calculate target white pixels for each image
+    non_jewelry_mask = 1 - jewelry_mask  # Areas where we can place white
+    total_non_jewelry_pixels = non_jewelry_mask.sum(dim=(2,3))  # [B,1] pixels per image
+    target_white_pixels = (total_non_jewelry_pixels * white_coverage_percent / 100).long()
+    
+    # Track current white pixel count per image
+    current_white_pixels = torch.zeros(B, device=device)
+    
+    # Adaptive patch generation
+    iterations = 0
+    min_patch_size = patch_size_range[0]
+    max_patch_size = patch_size_range[1]
+    
+    while iterations < max_iterations:
+        # Check which images need more white pixels
+        needs_more = current_white_pixels < target_white_pixels.squeeze()
+        if not needs_more.any():
+            break  # All images have reached target
+        
+        # Adaptive patch size: use smaller patches as we get closer to target
+        for b in range(B):
+            if not needs_more[b]:
+                continue
+                
+            # Calculate how far we are from target
+            pixels_needed = target_white_pixels[b, 0].item() - current_white_pixels[b].item()
+            total_target = target_white_pixels[b, 0].item()
+            
+            # Adaptive patch size based on remaining pixels needed
+            if pixels_needed < 500:
+                # Use smaller patches when close to target for fine control
+                patch_h = torch.randint(min_patch_size//2, min_patch_size, (1,)).item()
+                patch_w = torch.randint(min_patch_size//2, min_patch_size, (1,)).item()
+            elif pixels_needed < 2000:
+                # Medium patches for moderate coverage
+                patch_h = torch.randint(min_patch_size, (min_patch_size + max_patch_size)//2, (1,)).item()
+                patch_w = torch.randint(min_patch_size, (min_patch_size + max_patch_size)//2, (1,)).item()
+            else:
+                # Large patches for initial coverage
+                patch_h = torch.randint((min_patch_size + max_patch_size)//2, max_patch_size, (1,)).item()
+                patch_w = torch.randint((min_patch_size + max_patch_size)//2, max_patch_size, (1,)).item()
+            
+            # Random position
+            max_y = max(1, H - patch_h)
+            max_x = max(1, W - patch_w)
+            y = torch.randint(0, max_y, (1,)).item()
+            x = torch.randint(0, max_x, (1,)).item()
+            
+            # Create patch mask for this position
+            patch_mask = torch.zeros_like(progressive_masks[b:b+1])
+            patch_mask[0, 0, y:y+patch_h, x:x+patch_w] = 1.0
+            
+            # Only add white where: (1) not already white, (2) not jewelry
+            valid_patch = patch_mask * (1 - progressive_masks[b:b+1]) * non_jewelry_mask[b:b+1]
+            
+            # Add the valid patch to the mask
+            progressive_masks[b:b+1] += valid_patch
+            
+            # Update white pixel count
+            current_white_pixels[b] += valid_patch.sum().item()
+        
+        iterations += 1
+        
+        # Check overall progress every 50 iterations
+        if iterations % 50 == 0:
+            current_coverage = (current_white_pixels / total_non_jewelry_pixels.squeeze()).mean().item() * 100
+            if iterations % 200 == 0:  # Log less frequently
+                print(f"Iteration {iterations}: Current coverage = {current_coverage:.1f}%, Target = {white_coverage_percent}%")
+    
+    # Final check and adjustment if needed
+    for b in range(B):
+        actual_coverage = (current_white_pixels[b] / total_non_jewelry_pixels[b, 0]).item() * 100
+        if abs(actual_coverage - white_coverage_percent) > 5:  # Allow 5% tolerance
+            print(f"Warning: Image {b} achieved {actual_coverage:.1f}% coverage instead of {white_coverage_percent}%")
+    
+    # Ensure jewelry pixels remain black (double-check)
+    progressive_masks = progressive_masks * (1 - jewelry_mask)
+    
+    # Clamp values to [0,1] and convert to uint8
+    progressive_masks = progressive_masks.clamp(0, 1)
+    
+    return (progressive_masks * 255).byte()
+
+
 # -------------- HF -> Torch loader -------------
 
 class HFDSourceMaskDataset(Dataset):
-    def __init__(self, ds: datasets.Dataset, process_col: str, mask_col: str):
+    def __init__(self, ds: datasets.Dataset, process_col: str, mask_col: str, 
+                 mask_coverage: float = None):
         """
         process_col: The column to process (might be same as target)
         mask_col: The mask column
+        mask_coverage: White coverage percentage for progressive masking (None = use original)
         """
         self.ds = ds
         self.process_col = process_col
         self.mask_col = mask_col
+        self.mask_coverage = mask_coverage
 
     def __len__(self):
         return len(self.ds)
@@ -112,11 +234,11 @@ class HFDSourceMaskDataset(Dataset):
                 mode="nearest",
             ).squeeze(0).squeeze(0).to(torch.uint8)
 
-        return idx, t_src, t_msk.unsqueeze(0)  # [1,H,W] mask
+        return idx, t_src, t_msk.unsqueeze(0), self.mask_coverage  # [1,H,W] mask
 
 
 def pad_collate(batch):
-    idxs, imgs, masks = zip(*batch)
+    idxs, imgs, masks, coverages = zip(*batch)
     max_h = max(x.shape[1] for x in imgs)
     max_w = max(x.shape[2] for x in imgs)
     p_imgs, p_masks, sizes = [], [], []
@@ -131,11 +253,16 @@ def pad_collate(batch):
         p_imgs.append(im); p_masks.append(mk)
     imgs_b = torch.stack(p_imgs, dim=0)   # uint8 [B,3,Hmax,Wmax]
     masks_b= torch.stack(p_masks, dim=0)  # uint8 [B,1,Hmax,Wmax]
+    
+    # Return mask coverage for this batch (should be same for all items)
+    mask_coverage = coverages[0] if coverages[0] is not None else None
+    
     return (
         torch.tensor(idxs, dtype=torch.long),
         imgs_b.contiguous(),
         masks_b.contiguous(),
         torch.tensor(sizes, dtype=torch.int32),
+        mask_coverage
     )
 
 
@@ -161,15 +288,17 @@ def build_level_dataset_fast_masked(
     Build a processed dataset for one level where:
       - If source_col == target_col: Create a synthetic 'source' column with processed target
       - Otherwise: Process the source_col and leave target_col untouched
+      - Additionally process masks according to difficulty_mask_coverage
     """
     cache_root = Path(cache_root); cache_root.mkdir(parents=True, exist_ok=True)
     
-    # Keep UID stable
+    # Keep UID stable 
     key = {
         "name": level["name"],
         "sigma": float(level["difficulty_blur_sigma"]),
         "alpha": float(level["difficulty_gray_alpha"]),
         "brightness": float(level.get("difficulty_brightness", 50.0)),
+        "mask_coverage": float(level.get("difficulty_mask_coverage", 100.0)),  
         "source_col": source_col,
         "target_col": target_col,
         "mask_col": mask_col,
@@ -197,9 +326,14 @@ def build_level_dataset_fast_masked(
         ds = ds.cast_column(mask_col, HFImage())
 
     imgs_dir = out_dir / "images"; imgs_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir = out_dir / "masks"; masks_dir.mkdir(parents=True, exist_ok=True)  # NEW
 
     torch.set_num_threads(max(1, os.cpu_count() // 2))
-    dset = HFDSourceMaskDataset(ds, process_col, mask_col)
+    
+    # Get mask coverage for this level
+    mask_coverage = float(level.get("difficulty_mask_coverage", 100.0))
+    
+    dset = HFDSourceMaskDataset(ds, process_col, mask_col, mask_coverage)
     loader = DataLoader(
         dset,
         batch_size=batch_size,
@@ -220,59 +354,87 @@ def build_level_dataset_fast_masked(
     kx, ky, radius = gaussian_kernels_1d(sigma, device)
 
     executor = ThreadPoolExecutor(max_workers=writer_threads)
-    def submit_write(idx_int: int, img_u8_chw: torch.Tensor):
+    
+    def submit_write_img(idx_int: int, img_u8_chw: torch.Tensor):
         fn = imgs_dir / f"{idx_int}.{save_format}"
         if save_format == "png":
             return executor.submit(write_png, img_u8_chw, str(fn))
         else:
             return executor.submit(write_jpeg, img_u8_chw, str(fn), quality=jpeg_quality)
+    
+    def submit_write_mask(idx_int: int, mask_u8: torch.Tensor):
+        fn = masks_dir / f"{idx_int}.png"  # Always PNG for masks
+        return executor.submit(write_png, mask_u8, str(fn))
 
     futures = []
-    with tqdm(total=len(dset), desc=f"{level['name']} (σ={sigma}, α={alpha}, β={brightness})") as pbar:
-        for idxs, batch_u8, masks_u8, sizes in loader:
+    with tqdm(total=len(dset), desc=f"{level['name']} (σ={sigma}, α={alpha}, β={brightness}, mask={mask_coverage}%)") as pbar:
+        for idxs, batch_u8, masks_u8, sizes, batch_mask_coverage in loader:
             batch_u8 = batch_u8.to(device, non_blocking=True)   # [B,3,H,W]
             masks_u8 = masks_u8.to(device, non_blocking=True)   # [B,1,H,W]
+            
+            # Process masks if coverage is specified and < 100
+            if batch_mask_coverage is not None and batch_mask_coverage < 100.0:
+                processed_masks_u8 = create_progressive_mask_batch(
+                    masks_u8, 
+                    batch_mask_coverage,
+                    patch_size_range=(80, 150),
+                    device=device
+                )
+            else:
+                processed_masks_u8 = masks_u8
+            
+            # Process images with original masks (for blur/gray/brightness)
             out_u8 = masked_bg_gray_blur_batch_uint8(
                 batch_u8, masks_u8, kx, ky, radius, alpha, brightness
             ).cpu()
+            
+            # Save both processed images and processed masks
+            processed_masks_cpu = processed_masks_u8.cpu()
 
             for i in range(out_u8.size(0)):
                 h, w = sizes[i].tolist()
                 img = out_u8[i, :, :h, :w].contiguous()
-                futures.append(submit_write(int(idxs[i]), img))
+                mask = processed_masks_cpu[i, :, :h, :w].contiguous()
+                
+                futures.append(submit_write_img(int(idxs[i]), img))
+                futures.append(submit_write_mask(int(idxs[i]), mask))
             pbar.update(out_u8.size(0))
 
     for f in tqdm(futures, desc="Flush writes"): f.result()
     executor.shutdown(wait=True)
 
     # Bind processed file paths back into a HF dataset
-    files = [str(imgs_dir / f"{i}.{save_format}") for i in range(len(ds))]
+    img_files = [str(imgs_dir / f"{i}.{save_format}") for i in range(len(ds))]
+    mask_files = [str(masks_dir / f"{i}.png") for i in range(len(ds))]
 
     if same_column:
         # Special case: source and target are the same column
-        # We need to create a new 'source' column with processed images
-        # and keep 'target' column with original images
         print(f"INFO: source_col == target_col ('{source_col}'). Creating synthetic 'source' column.")
         
         def path_mapper(example, idx):
             # Create a new 'source' column with processed image
-            example['source'] = files[idx]
+            example['source'] = img_files[idx]
+            # Update mask column with processed mask
+            example[mask_col] = mask_files[idx]
             # Keep the original target column unchanged
             return example
         
         ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Create synthetic source column")
         ds2 = ds2.cast_column('source', HFImage())  # processed source
-        # target column remains as original
+        ds2 = ds2.cast_column(mask_col, HFImage())  # processed mask
     else:
         # Normal case: source and target are different columns
         def path_mapper(example, idx):
-            # Replace ONLY source_col with processed path
-            example[source_col] = files[idx]
+            # Replace source_col with processed path
+            example[source_col] = img_files[idx]
+            # Update mask column with processed mask
+            example[mask_col] = mask_files[idx]
             # DO NOT touch target column (GT remains original)
             return example
         
-        ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Bind processed source paths")
+        ds2 = ds.map(path_mapper, with_indices=True, num_proc=1, desc="Bind processed paths")
         ds2 = ds2.cast_column(source_col, HFImage())  # processed source
+        ds2 = ds2.cast_column(mask_col, HFImage())   # processed mask
 
     tmp = Path(tempfile.mkdtemp(prefix="lvl_fast_"))
     try:
@@ -292,32 +454,49 @@ def save_topk_previews(out_dir: Path,
                        ds_cfg: str | None,
                        split: str,
                        process_col: str,
+                       mask_col: str,
                        fmt: str,
                        topk: int):
     """
     Uses the already-saved transformed files in out_dir/images/{idx}.{fmt}
-    and the ORIGINAL dataset to write side-by-side previews for idx in [0..topk-1].
+    and out_dir/masks/{idx}.png to create preview comparisons
     """
     if topk <= 0: return
     ds = datasets.load_dataset(ds_name, ds_cfg, split=split)
     if not isinstance(ds.features[process_col], HFImage):
         ds = ds.cast_column(process_col, HFImage())
+    if not isinstance(ds.features[mask_col], HFImage):
+        ds = ds.cast_column(mask_col, HFImage())
 
     prev_dir = out_dir / "preview"
     prev_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(min(topk, len(ds))):
-        orig_pil = ds[i][process_col]  # original image (before replacement)
+        orig_pil = ds[i][process_col]  # original image
+        orig_mask = ds[i][mask_col]    # original mask
+        
         tr_path = out_dir / "images" / f"{i}.{fmt}"
-        if not tr_path.exists():
+        mask_path = out_dir / "masks" / f"{i}.png"
+        
+        if not tr_path.exists() or not mask_path.exists():
             continue
+            
         tr_pil = Image.open(tr_path).convert("RGB")
-        # side-by-side
-        w = orig_pil.width + tr_pil.width
-        h = max(orig_pil.height, tr_pil.height)
-        board = Image.new("RGB", (w, h))
+        tr_mask = Image.open(mask_path).convert("L")
+        
+        # Create 2x2 grid: [orig_img, trans_img], [orig_mask, trans_mask]
+        w = orig_pil.width
+        h = orig_pil.height
+        board = Image.new("RGB", (w * 2, h * 2))
+        
+        # Top row: images
         board.paste(orig_pil, (0, 0))
-        board.paste(tr_pil, (orig_pil.width, 0))
+        board.paste(tr_pil, (w, 0))
+        
+        # Bottom row: masks
+        board.paste(orig_mask.convert("RGB"), (0, h))
+        board.paste(tr_mask.convert("RGB"), (w, h))
+        
         board.save(prev_dir / f"idx{i}_{level_name}.png")
 
 
@@ -349,7 +528,7 @@ def main():
     ds_name = base_cfg["dataset_name"]
     ds_cfg  = base_cfg.get("dataset_config_name", None)
     source_col = base_cfg["source_image_column"]
-    target_col = base_cfg.get("target_image_column", "target")  # default to 'target' if not specified
+    target_col = base_cfg.get("target_image_column", "target")
     mask_col   = base_cfg["mask_column"]
 
     levels = levels_cfg.get("levels", [])
@@ -380,11 +559,12 @@ def main():
         # For preview, use the column that was actually processed
         process_col = target_col if source_col == target_col else source_col
         try:
-            save_topk_previews(out_dir, lvl["name"], ds_name, ds_cfg, args.split, process_col, args.fmt, args.preview_topk)
+            save_topk_previews(out_dir, lvl["name"], ds_name, ds_cfg, args.split, 
+                             process_col, mask_col, args.fmt, args.preview_topk)
         except Exception:
             pass  # previews are best-effort
 
-    # Emit a small summary file (handy for debugging)
+    # Emit a small summary file
     summary = cache_root / "last_build_summary.json"
     with open(summary, "w") as f:
         json.dump(built, f, indent=2)

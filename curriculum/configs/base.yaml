@@ -3,10 +3,10 @@
 # ─────────────────────────────────────────────
 
 ### I/O & tracking
-output_dir: blur_saks_transformer_weights_c1        # overridden by CurriculumManager per level
+output_dir: blur_saks_transformer_weights_c2        # overridden by CurriculumManager per level
 logging_dir: logs
 report_to: wandb
-tracker_project_name: SAKS_conditional_generation_c1
+tracker_project_name: SAKS_conditional_generation_c2
 push_to_hub: false
 hub_token: null
 

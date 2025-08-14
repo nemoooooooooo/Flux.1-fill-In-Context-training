@@ -42,6 +42,7 @@ class DifficultyLevel:
     difficulty_blur_sigma: float
     difficulty_gray_alpha: float
     difficulty_brightness: float = 50.0
+    difficulty_mask_coverage: float = 100.0  # NEW: percentage of white patches in mask
     level_index: int = 0
     is_sublevel: bool = False
     parent_level: Optional[str] = None
@@ -224,6 +225,7 @@ class CurriculumManager:
                 difficulty_blur_sigma=level_data["difficulty_blur_sigma"],
                 difficulty_gray_alpha=level_data["difficulty_gray_alpha"],
                 difficulty_brightness=level_data.get("difficulty_brightness", 50.0),
+                difficulty_mask_coverage=level_data.get("difficulty_mask_coverage", 100.0),  # NEW
                 level_index=idx,
                 val_every_steps=level_data.get("val_every_steps", None)  # Get per-level steps
             )
@@ -272,7 +274,8 @@ class CurriculumManager:
                 "name": level.name,
                 "difficulty_blur_sigma": level.difficulty_blur_sigma,
                 "difficulty_gray_alpha": level.difficulty_gray_alpha,
-                "difficulty_brightness": level.difficulty_brightness
+                "difficulty_brightness": level.difficulty_brightness,
+                "difficulty_mask_coverage": level.difficulty_mask_coverage
             }]
         }
         
@@ -346,7 +349,8 @@ class CurriculumManager:
                 "name": level.name,
                 "difficulty_blur_sigma": level.difficulty_blur_sigma,
                 "difficulty_gray_alpha": level.difficulty_gray_alpha,
-                "difficulty_brightness": level.difficulty_brightness
+                "difficulty_brightness": level.difficulty_brightness,
+                "difficulty_mask_coverage": level.difficulty_mask_coverage
             }]
         }
         
@@ -583,11 +587,10 @@ class CurriculumManager:
             logger.error(f"Training failed with return code: {e.returncode}")
             raise
 
-    
     def create_intermediate_level(self, 
-                                 baseline_level: DifficultyLevel,
-                                 target_level: DifficultyLevel,
-                                 retry_num: int) -> DifficultyLevel:
+                                baseline_level: DifficultyLevel,
+                                target_level: DifficultyLevel,
+                                retry_num: int) -> DifficultyLevel:
         """Create intermediate difficulty level between baseline and target"""
         
         # Progressive interpolation - gets closer to target with each retry
@@ -595,17 +598,22 @@ class CurriculumManager:
         factor = max(0.5 - (0.2 * retry_num), 0.05)
         
         new_sigma = baseline_level.difficulty_blur_sigma + \
-                   (target_level.difficulty_blur_sigma - baseline_level.difficulty_blur_sigma) * factor
+                (target_level.difficulty_blur_sigma - baseline_level.difficulty_blur_sigma) * factor
         new_alpha = baseline_level.difficulty_gray_alpha + \
-                   (target_level.difficulty_gray_alpha - baseline_level.difficulty_gray_alpha) * factor
+                (target_level.difficulty_gray_alpha - baseline_level.difficulty_gray_alpha) * factor
         new_brightness = baseline_level.difficulty_brightness + \
                         (target_level.difficulty_brightness - baseline_level.difficulty_brightness) * factor
+        
+        # Interpolate mask coverage too
+        baseline_coverage = getattr(baseline_level, 'difficulty_mask_coverage', 100.0)
+        target_coverage = getattr(target_level, 'difficulty_mask_coverage', 100.0)
+        new_mask_coverage = baseline_coverage + (target_coverage - baseline_coverage) * factor
         
         # For intermediate levels, inherit validation steps from target level
         # or use a weighted average
         if target_level.val_every_steps and baseline_level.val_every_steps:
             new_val_steps = int(baseline_level.val_every_steps + 
-                               (target_level.val_every_steps - baseline_level.val_every_steps) * factor)
+                            (target_level.val_every_steps - baseline_level.val_every_steps) * factor)
         else:
             new_val_steps = target_level.val_every_steps or baseline_level.val_every_steps
         
@@ -614,6 +622,7 @@ class CurriculumManager:
             difficulty_blur_sigma=round(new_sigma, 2),
             difficulty_gray_alpha=round(new_alpha, 2),
             difficulty_brightness=round(new_brightness, 1),
+            difficulty_mask_coverage=round(new_mask_coverage, 1),  # NEW
             level_index=target_level.level_index,  # Keep target index for ordering
             is_sublevel=True,
             parent_level=baseline_level.name,
@@ -624,6 +633,7 @@ class CurriculumManager:
         logger.info(f"  Blur: {baseline_level.difficulty_blur_sigma} -> {new_level.difficulty_blur_sigma} -> {target_level.difficulty_blur_sigma}")
         logger.info(f"  Gray: {baseline_level.difficulty_gray_alpha} -> {new_level.difficulty_gray_alpha} -> {target_level.difficulty_gray_alpha}")
         logger.info(f"  Brightness: {baseline_level.difficulty_brightness} -> {new_level.difficulty_brightness} -> {target_level.difficulty_brightness}")
+        logger.info(f"  Mask Coverage: {baseline_coverage}% -> {new_level.difficulty_mask_coverage}% -> {target_coverage}%")  # NEW
         logger.info(f"  Val Steps: {self.get_validation_steps(new_level)}")
         
         return new_level
